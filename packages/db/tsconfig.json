@@ -1,0 +1,7 @@
+{
+  "extends": "@kisan4u/config/typescript/base.json",
+  "compilerOptions": {
+    "outDir": "dist"
+  },
+  "include": ["src", "prisma/seed.ts"]
+}

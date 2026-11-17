@@ -1,0 +1,4305 @@
+// Kisan4U — Prisma schema (Phase 0)
+//
+// This is the initial normalized schema derived from DATABASE_MODEL_PLAN.md,
+// with the following fixes applied before finalizing (per Phase 0 review):
+//   1. Added missing back-relation fields so every @relation is declared on
+//      both sides (Category.products, Brand.products, SellerProfile.orders,
+//      Address.shippingOrders/billingOrders, etc.).
+//   2. Split the legacy-inspired combined "Review" model into ProductReview
+//      and DeliveryManRating — two distinct models instead of one model with
+//      nullable dual-purpose foreign keys.
+//   3. Removed the dangling `SellerProfile.marketingPlan` field that pointed
+//      at an undefined model — seller marketing plans are out of scope for
+//      Phase 0 (see BUILD_PHASES.md Phase 10) and will be modeled when built.
+//   4. Kept `Wallet`/`WithdrawRequest` ownership as plain (ownerType, ownerId)
+//      scalars rather than a Prisma @relation, since they intentionally
+//      reference whichever of User/SellerProfile/AdminProfile/
+//      DeliveryManProfile matches ownerType — Prisma relations require a
+//      single target table, so this polymorphic reference is enforced at the
+//      application layer, not the database layer. This mirrors the explicit
+//      design tradeoff called out in DATABASE_MODEL_PLAN.md §8.
+//   5. A handful of other cross-references that are informational rather
+//      than structural (e.g. OrderStatusHistory.changedById, which may point
+//      at a User, Admin, or Seller depending on changedByRole) are likewise
+//      left as plain scalar columns instead of forced single-table relations.
+//
+// No business data lives here yet — this is schema only (Phase 0).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// 1. Identity & Roles
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  CUSTOMER // default segment — retail buyer
+  DEALER
+  SELLER
+  BUSINESS_ASSOCIATE
+  ADMIN
+  DELIVERY_MAN
+  STAFF // restricted employee account (e.g. Sales Agent) — see Role/RolePermission
+}
+
+enum PermissionAction {
+  VIEW
+  CREATE
+  EDIT
+  DELETE
+}
+
+enum AccountDeletionStatus {
+  SCHEDULED
+  CANCELLED
+  COMPLETED
+  BLOCKED
+  PENDING_REVIEW
+}
+
+enum AccountDeletionSource {
+  SELF
+  ADMIN
+}
+
+model User {
+  id                 String                    @id @default(cuid())
+  phone              String?                   @unique
+  email              String?                   @unique
+  passwordHash       String? // null for OTP-only roles
+  // Split from a single `name` field for the legacy customer migration
+  // (~67,880 old accounts, most phone-only signups with no name captured
+  // at all). Both nullable — use getFullName() from @kisan4u/db for
+  // display, and let call sites pick their own fallback (phone, "—",
+  // etc.) when both are absent. The new app's own OTP signup flow
+  // already treats name as optional, so this matches existing behavior.
+  firstName          String?
+  lastName           String?
+  // Old `users.id` from the legacy Laravel/MySQL site, set only for
+  // migrated accounts. Makes the migration script safely re-runnable
+  // (upsert by legacyId) and lets a later migration phase (orders)
+  // resolve an old orders.customer_id to this User.id.
+  legacyId           String?                   @unique
+  role               UserRole                  @default(CUSTOMER)
+  isPhoneVerified    Boolean                   @default(false)
+  isEmailVerified    Boolean                   @default(false)
+  referralCode       String                    @unique
+  referredById       String?
+  referredBy         User?                     @relation("Referral", fields: [referredById], references: [id])
+  referrals          User[]                    @relation("Referral")
+  // Business Associate who referred this account (BA program). Captured
+  // once, at registration, from a "BA-XXXXXX" code — never changed later,
+  // never self-referable. Distinct from referredById above (generic
+  // user-to-user referral, unused today). Survives the customer->dealer
+  // same-row upgrade so a referred customer who becomes a dealer stays
+  // attributed to the same BA.
+  referredByBaId     String?
+  referredByBa       BusinessAssociateProfile? @relation("BaReferral", fields: [referredByBaId], references: [id])
+  isActive           Boolean                   @default(true)
+  // Guest-checkout placeholder account (storefront only). Created the first
+  // time a not-signed-in visitor adds something to their cart, so the cart
+  // (CartItem.userId, non-nullable) has an owner while they browse; carries
+  // a signed cookie holding this id (apps/web/src/lib/guest-cart.ts). On
+  // the checkout page the guest verifies a phone via OTP, which either
+  // signs them into their real account or auto-creates one; the guest's
+  // cart rows are then re-pointed onto that account and this row is
+  // deleted (claimGuestCartAction). While set: excluded from the admin
+  // customer roster / POS search, never has a phone or password, and is
+  // safe for a later cron to sweep if abandoned.
+  isGuest            Boolean                   @default(false)
+  // Phase 2 fix: bumped whenever an admin approves/rejects/suspends/
+  // reinstates this user's application or toggles isActive. Embedded in
+  // the JWT at sign-in (see packages/auth/src/shared.ts); every protected
+  // page/action re-compares the token's value against this live column
+  // (packages/auth/src/access.ts:validateUserSession) — a mismatch means
+  // the session was revoked after it was issued, so it's rejected even
+  // though the JWT itself is still validly signed and unexpired.
+  sessionVersion     Int                       @default(0)
+  // Set true whenever an admin issues a fresh temporary password for this
+  // account (packages/auth/src/password-reset.ts:adminResetPassword) —
+  // checked fresh from the database on every protected request
+  // (packages/auth/src/access.ts:validateUserSession, same live-check
+  // convention as sessionVersion above), forcing the user to
+  // /change-password before they can reach anything else. Cleared only by
+  // a successful self-service password change (changeOwnPassword).
+  mustChangePassword Boolean                   @default(false)
+  deletionRequestedAt DateTime?
+  deletionScheduledFor DateTime?
+  deletedAt            DateTime?
+  // Customer-only (role CUSTOMER) account-level state selection — controls
+  // which state-classified Customer products this account can browse/buy,
+  // independent of any CustomerAddress.stateId (which governs delivery,
+  // not catalogue eligibility). Nullable/one-time-settable BY DESIGN: once
+  // non-null, only an admin may change it (enforced server-side in
+  // packages/catalog/src/customer-state.ts, never trust a client payload
+  // that tries to overwrite an already-set value). Deliberately a plain
+  // relation on User rather than a new CustomerProfile model, mirroring
+  // DealerProfile.stateId's normalized-state pattern — Customer has no
+  // profile table of its own to add this to.
+  stateId            String?
+  indianState        IndianState?              @relation(fields: [stateId], references: [id])
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+
+  dealerProfile   DealerProfile?
+  sellerProfile   SellerProfile?
+  baProfile       BusinessAssociateProfile?
+  adminProfile    AdminProfile?
+  deliveryProfile DeliveryManProfile?
+  staffProfile    StaffProfile?
+
+  addresses                CustomerAddress[]
+  cartItems                CartItem[]
+  wishlistItems            WishlistItem[]
+  checkoutGroups           CheckoutGroup[]
+  sellerOrders             SellerOrder[]
+  // POS orders this account placed on a customer/dealer's behalf — see
+  // CheckoutGroup.placedByUserId. Not the buyer relation above (checkoutGroups).
+  posCheckoutsPlaced       CheckoutGroup[]             @relation("CheckoutGroupPlacedBy")
+  posPaymentProofsUploaded PosPaymentProofSubmission[] @relation("PosPaymentProofUploadedBy")
+  posPaymentProofsReviewed PosPaymentProofSubmission[] @relation("PosPaymentProofReviewedBy")
+  payments                 Payment[]
+  productReviews           ProductReview[]
+  deliveryManRatings       DeliveryManRating[]
+  couponRedemptions        CouponRedemption[]
+  refundRequests           RefundRequest[]
+  notificationPrefs        NotificationPreference?
+  notifications            Notification[]
+  pushDevices              PushDevice[]
+  cartReminder             CartReminder?
+  supportTickets           SupportTicket[]
+  restockSubscriptions     RestockSubscription[]
+  bulkProductDraftsCreated BulkProductDraft[]
+  proposedOrdersAsReferee  ProposedOrder[]             @relation("ProposedOrderReferee")
+  accountDeletionRequests AccountDeletionRequest[]
+  mobileSessions          MobileSession[]
+
+  @@index([deletionScheduledFor])
+}
+
+model MobileSession {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId       String
+  deviceName     String
+  refreshTokenId String    @unique
+  lastUsedAt     DateTime  @default(now())
+  revokedAt      DateTime?
+  revokeReason   String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([userId, revokedAt])
+  @@index([userId, deviceId])
+}
+
+model AccountDeletionRequest {
+  id               String                  @id @default(cuid())
+  userId           String
+  user             User                    @relation(fields: [userId], references: [id])
+  status           AccountDeletionStatus
+  source           AccountDeletionSource
+  reason           String?
+  requestedAt      DateTime                @default(now())
+  scheduledFor     DateTime?
+  completedAt      DateTime?
+  phoneHash        String?
+  emailHash        String?
+  blockersSnapshot Json?
+  walletForfeitureAccepted Boolean             @default(false)
+
+  @@index([userId, requestedAt])
+  @@index([status, scheduledFor])
+}
+
+// Phase 1 addition (not in the original DATABASE_MODEL_PLAN.md — a
+// foundational piece needed to make phone-OTP login actually work, not a
+// business module). No relation to User: a phone may not have an account
+// yet at the time an OTP is requested.
+model OtpCode {
+  id           String     @id @default(cuid())
+  phone        String
+  codeHash     String
+  purpose      OtpPurpose
+  attempts     Int        @default(0)
+  ip           String?
+  expiresAt    DateTime
+  consumedAt   DateTime?
+  supersededAt DateTime?
+  createdAt    DateTime   @default(now())
+
+  @@index([phone, purpose, createdAt])
+}
+
+enum OtpPurpose {
+  LOGIN
+  DEALER_REGISTRATION
+  SELLER_APPLY
+  ACCOUNT_DELETION
+  GUEST_CHECKOUT
+}
+
+model RateLimitBucket {
+  id           String    @id @default(cuid())
+  scope        String
+  keyHash      String
+  windowStart  DateTime
+  count        Int       @default(0)
+  blockedUntil DateTime?
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([scope, keyHash, windowStart])
+  @@index([expiresAt])
+}
+
+// One-time, short-lived redemption record for opening a private KYC
+// document in an external mobile viewer that cannot attach a bearer token.
+model PrivateDocumentDownload {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  userId     String
+  field      String
+  storageKey String
+  expiresAt  DateTime
+  redeemedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([expiresAt])
+  @@index([userId, createdAt])
+}
+
+// Phase 2 fix: a short-lived, one-time, server-side ticket proving a
+// phone number was OTP-verified for dealer *registration* specifically
+// (distinct from OtpCode, which is consumed the moment it's checked and
+// carries no further state). Referenced from the browser only by its
+// opaque id in an httpOnly cookie — the phone number itself never
+// round-trips through client input again after verification, so the
+// final registration form can't be reached, and can't be submitted for a
+// different phone, without a valid row here. See
+// packages/auth/src/onboarding.ts.
+model DealerOnboardingSession {
+  id         String    @id @default(cuid())
+  phone      String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  uploads    DealerOnboardingUpload[]
+
+  @@index([phone])
+}
+
+model DealerOnboardingUpload {
+  id         String                  @id @default(cuid())
+  sessionId  String
+  session    DealerOnboardingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  storageKey String                  @unique
+  createdAt  DateTime                @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+model SellerOnboardingSession {
+  id          String    @id @default(cuid())
+  phone       String
+  ip          String?
+  uploadCount Int       @default(0)
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  uploads     SellerOnboardingUpload[]
+
+  @@index([phone])
+  @@index([expiresAt])
+}
+
+model SellerOnboardingUpload {
+  id         String                  @id @default(cuid())
+  sessionId  String
+  session    SellerOnboardingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  storageKey String                  @unique
+  createdAt  DateTime                @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+// Phase 3 addition: a short-lived, repeat-viewable (NOT single-consume —
+// a dealer may reload the pending-status page several times) ticket that
+// lets a just-registered dealer see /dealer/status immediately after
+// submitting their application, without either (a) forcing a fresh
+// login, which the current OTP architecture has no way to grant
+// server-side from within a registration Server Action, or (b) exposing
+// another dealer's status through a URL-supplied id — the browser only
+// ever holds this row's opaque id in an httpOnly cookie, and the page
+// resolves dealerProfileId from THIS row server-side, never from a query
+// param. See packages/auth/src/onboarding.ts.
+model DealerStatusViewSession {
+  id              String   @id @default(cuid())
+  dealerProfileId String
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+
+  @@index([dealerProfileId])
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  DOCUMENTS_UPLOADED
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
+// Phase 2: the admin-facing approval decision, shared by both DealerProfile
+// and SellerProfile (was `SellerStatus`, renamed + reused so dealer and
+// seller applications go through one consistent admin workflow). This is
+// distinct from DealerProfile.kycStatus, which tracks how far along the
+// applicant is in submitting documents — `status` is the admin's final
+// call: PENDING (awaiting review) -> APPROVED | REJECTED, or APPROVED ->
+// SUSPENDED by an admin later. See packages/auth/src/access.ts for the
+// server-side enforcement (checked on every protected page load, not just
+// in middleware — middleware runs on the Edge runtime and has no DB access).
+//
+// Phase 3 fix: also reused by seller-submitted Brand/Manufacturer requests
+// (see those models below) — same PENDING->APPROVED/REJECTED->SUSPENDED
+// shape, plus INACTIVE for an admin/seller retiring an entry that isn't
+// being suspended for cause.
+enum ApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+  INACTIVE
+}
+
+model DealerProfile {
+  id                  String            @id @default(cuid())
+  userId              String            @unique
+  user                User              @relation(fields: [userId], references: [id])
+  kycStatus           KycStatus         @default(NOT_SUBMITTED)
+  status              ApplicationStatus @default(PENDING)
+  gstNumber           String?
+  gstDocUrl           String?
+  licenseNumber       String?
+  licenseDocUrl       String?
+  storeName           String?
+  storeAddress        String?
+  city                String?
+  state               String? // free-text, kept for back-compat/display
+  // Phase 3 addition: normalized state, used to match dealer-visible
+  // products against Product.availableStates. Additive/nullable — the
+  // free-text `state` column above is untouched, nothing destructive.
+  stateId             String?
+  indianState         IndianState?      @relation(fields: [stateId], references: [id])
+  pincode             String?
+  isUnregistered      Boolean           @default(false)
+  rejectionReason     String?
+  // Legacy dealer-KYC migration: the old site had two generic, unlabeled
+  // "extra document" slots (doc3/doc4) beyond GST/license — the legacy app
+  // itself never defined what they represent (confirmed by inspecting its
+  // own form code, not just the DB column names), so this isn't modeled as
+  // named columns. Array of { label, number, docUrl }, additive/nullable —
+  // never populated by anything but the migration script for now. See
+  // migrate-legacy-dealers.ts.
+  additionalDocuments Json?
+  // A proposed set of profile edits (fields + re-uploaded doc URLs)
+  // awaiting a second admin "Approve changes" click — populated only for
+  // an APPROVED dealer, since a PENDING/REJECTED application is still
+  // edited in place (its own approval is the gate). null = nothing
+  // pending. Shape: { storeName?, storeAddress?, city?, pincode?,
+  // gstNumber?, licenseNumber?, stateId?, gstDocUrl?, licenseDocUrl?,
+  // proposedByUserId, proposedAt }. See packages/auth/src/access.ts.
+  pendingChanges      Json?
+  // True when this dealer is APPROVED but gstDocUrl or licenseDocUrl is
+  // null — an intentional exception, not a data-quality bug. Legacy
+  // dealers migrated from the old site (see migrate-legacy-dealers.ts)
+  // were already vetted and approved there; the normal live rule ("no
+  // document, no approval") doesn't apply retroactively, since it was
+  // never their fault the old system's document wasn't recoverable. Owner's
+  // explicit decision, 2026-09-17: keep them APPROVED, just flag it so ops
+  // can work through the backlog. Recomputed automatically in
+  // approveDealerProfileChanges whenever ops uploads a missing doc through
+  // the normal edit-approval flow — clears itself once both are present.
+  hasMissingDocuments Boolean           @default(false)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  productRequests SellerProductRequest[]
+}
+
+model SellerProfile {
+  id                      String            @id @default(cuid())
+  userId                  String            @unique
+  user                    User              @relation(fields: [userId], references: [id])
+  shopName                String // "Company Name" on the seller application form
+  slug                    String            @unique
+  // Collected on the seller application form (apps/web/src/app/seller/apply).
+  // Nullable because every row that predates this onboarding rework (demo
+  // seed, the old 5-field form) has none.
+  contactPersonName       String?
+  companyWebsite          String?
+  // Structured registered address collected on the apply form (apps/web/
+  // src/app/seller/apply). `registeredAddress` is kept as a composed,
+  // single-line rendering of the fields below for back-compat with the
+  // admin seller-detail display/edit — the structured columns are the
+  // source of truth for a new application. All nullable: rows that predate
+  // this rework (and the old single-textarea form) have only
+  // registeredAddress.
+  registeredAddress       String?
+  registeredAddressLine1  String?
+  registeredAddressLine2  String?
+  registeredCity          String?
+  registeredDistrict      String?
+  registeredState         String? // free-text state name from the form's dropdown
+  registeredPincode       String?
+  // Business/e-commerce contact for this seller — deliberately separate
+  // from the login identity on User (User.email / User.phone), which stay
+  // the account's sign-in credentials. Populated from the onboarding
+  // "seller detail" sheet and editable on the admin seller page. Nullable:
+  // rows predating this have none.
+  contactEmail            String?
+  contactMobile           String?
+  gstNumber               String?
+  gstDocUrl               String?
+  // PAN card NUMBER as text (e.g. "ABMCS7333Q") — the uploaded PAN
+  // document itself is panDocUrl. Nullable for the same reason as above.
+  panNumber               String?
+  bankName                String?
+  accountHolder           String?
+  accountNumber           String?
+  ifscCode                String?
+  bankBranch              String?
+  panDocUrl               String?
+  // Signed seller agreement PDF, uploaded by an admin (seller detail page's
+  // "Seller Agreement" tab) and viewable by the seller under Account →
+  // Agreement. Private storage key (uploadPrivateDocument), served only
+  // through the authenticated /api/seller-agreement/[sellerProfileId] route.
+  agreementStorageKey     String?
+  agreementFileName       String?
+  agreementUploadedAt     DateTime?
+  // The states this seller plans to sell in, chosen on the application
+  // form. A plain declared intent — NOT a licence/eligibility gate (that
+  // stays SellerLicenceSubmission's job).
+  sellingStates           IndianState[]     @relation("SellerSellingStates")
+  status                  ApplicationStatus @default(PENDING)
+  rejectionReason         String?
+  commissionPercent       Decimal           @default(0)
+  dealerCommissionPercent Decimal           @default(0)
+  minOrderAmount          Decimal           @default(0)
+  freeDeliveryOverAmount  Decimal?
+  vacationStart           DateTime?
+  vacationEnd             DateTime?
+  vacationNote            String?
+  isTemporarilyClosed     Boolean           @default(false)
+  bannerUrl               String?
+  offerBannerUrl          String?
+  // RapidShyp dashboard's `pickup_name` this seller's orders dispatch
+  // from (GET /fetch_pickup_location) — a seller-level fact ("which hub
+  // do we ship this seller's orders from"), not tied to any one
+  // SellerPickupPoint row, since a seller can be RapidShyp-eligible with
+  // no SellerPickupPoint of their own on file at all. Null = admin cannot
+  // push this seller's orders to RapidShyp yet.
+  rapidshypPickupName     String?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+
+  products              Product[]
+  cartItems             CartItem[]
+  sellerOrders          SellerOrder[]
+  pickupPoints          SellerPickupPoint[]
+  shippingMethods       ShippingMethod[]
+  deliveryMen           DeliveryManProfile[]
+  warehouses            Warehouse[]
+  licenceSubmissions    SellerLicenceSubmission[]
+  complianceReviews     ProductComplianceReview[]
+  coupons               Coupon[]
+  ownedBrands           Brand[]
+  ownedManufacturers    Manufacturer[]
+  productRequests       SellerProductRequest[]
+  settlementRateConfigs SettlementRateConfig[]
+  settlements           SellerSettlement[]
+  stockAdjustments      StockAdjustment[]
+  bulkProductDrafts     BulkProductDraft[]
+  bulkProductGroups     BulkProductGroup[]        @relation("BulkProductGroupSeller")
+  baRateConfigs         BaRateConfig[]
+
+  // NOTE: seller marketing-plan subscriptions (MODULE_LIST.md §9) are
+  // intentionally not modeled yet — see BUILD_PHASES.md Phase 10.
+}
+
+// ============================================================================
+// Business Associate (BA) program — referral-driven affiliate scheme.
+// A BA is any User (customer or dealer) who fills Form 1 (basic info), is
+// admin-approved, and gets a shareable referral code. They earn:
+//   - a flat amount when someone registers with their code (₹50, configurable)
+//   - a flat dealer bonus (₹50 at a direct dealer signup + ₹50 at approval)
+//   - a % of every order a referred user places (default 2%, per-seller /
+//     per-customer-type overridable via BaRateConfig)
+// Each earning is LOCKED until the referred user's triggering order is
+// DELIVERED and the 48h return window has elapsed, then ELIGIBLE, then paid
+// out once a month (last day) via a manual admin bank transfer recorded on
+// BaSettlement. Config changes are forward-only; every earning snapshots the
+// figure it was computed from. Gated globally by SiteSettings.baProgramEnabled.
+// ============================================================================
+
+enum BaStatus {
+  PENDING // Form 1 submitted, awaiting admin approval
+  APPROVED // admin approved — earns + can place proposed orders; cannot redeem ("Approved BA without bank details")
+  BANK_SUBMITTED // Form 2 (KYC/bank) submitted — fully "Approved BA", redemption unlocked
+  REJECTED // admin declined Form 1 (a fresh Form 1 re-opens as PENDING)
+  SUSPENDED // admin froze the BA — code stops working, no new earnings; already-ELIGIBLE amounts still pay out
+}
+
+// Separate from BaStatus (which BANK_SUBMITTED already flips automatically
+// on Form 2 submit, with zero admin review) — this is the actual admin
+// approve/reject decision on the bank/KYC DETAILS themselves, so a BA
+// submitting bank details doesn't unlock payout until someone has actually
+// looked at them.
+enum BaBankStatus {
+  NOT_SUBMITTED
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+model BusinessAssociateProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  // Shareable, human-friendly referral code — distinct from User.referralCode
+  // (which every user already has and which this program does NOT use).
+  // Format "BA-XXXXXX". Referral capture at registration validates ONLY
+  // against this column.
+  referralCode String @unique
+
+  status BaStatus @default(PENDING)
+
+  // --- Form 1: basic info (all mandatory in the UI; stored here, never
+  // written back onto User) ---
+  firstName     String
+  lastName      String
+  contactNumber String // must equal the owner's verified User.phone (enforced server-side)
+  email         String
+  pincode       String
+  state         String
+  city          String
+
+  // --- Form 2: KYC + bank (all mandatory once submitted; gates redemption) ---
+  panNumber         String?   @unique
+  panDocKey         String? // storage key for the uploaded PAN copy
+  bankName          String?
+  bankBranch        String?
+  accountHolderName String?
+  accountNumber     String?   @unique
+  ifsc              String?
+  chequeDocKey      String? // storage key for the uploaded cancelled cheque
+  bankSubmittedAt   DateTime?
+
+  // Admin's approve/reject decision on the bank/KYC details above —
+  // independent of `status`'s own PENDING/APPROVED/BANK_SUBMITTED lifecycle
+  // (see BaBankStatus's doc comment). Payout eligibility (hasBankDetails,
+  // packages/orders/src/ba/profile.ts) gates on THIS, not on bankSubmittedAt.
+  bankStatus          BaBankStatus @default(NOT_SUBMITTED)
+  bankReviewedById    String?
+  bankReviewedAt      DateTime?
+  bankRejectionReason String?
+
+  approvedById   String?
+  approvedAt     DateTime?
+  rejectedReason String?
+  suspendedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  earnings          BaEarning[]
+  payouts           BaSettlement[]
+  referredCustomers User[]          @relation("BaReferral")
+  proposedOrders    ProposedOrder[]
+
+  @@index([status])
+}
+
+enum BaEarningKind {
+  REGISTRATION // a user registered with this BA's referral code
+  DEALER_SIGNUP // a referred user created a dealer account directly
+  DEALER_APPROVAL // a referred user's dealer application was approved
+  ORDER_COMMISSION // % of a referred user's delivered order (one row per seller order)
+}
+
+enum BaEarningStatus {
+  LOCKED // earned, but the trigger (referred user's order delivered + 48h) not yet met
+  ELIGIBLE // redeemable — included in the next monthly payout
+  SETTLED // paid out in a BaSettlement batch
+  REVERSED // clawed back (dealer rejection, order return/cancel, etc.)
+}
+
+model BaEarning {
+  id   String                   @id @default(cuid())
+  baId String
+  ba   BusinessAssociateProfile @relation(fields: [baId], references: [id])
+
+  kind   BaEarningKind
+  status BaEarningStatus @default(LOCKED)
+
+  amount Decimal // rupees, 2dp
+
+  // Who/what produced this earning (informational, not strict FKs).
+  sourceUserId          String
+  sourceSellerOrderId   String?
+  sourceCheckoutGroupId String?
+  sellerId              String?
+
+  // Config snapshots, frozen at creation (forward-only config).
+  ratePercentSnapshot    Decimal?
+  flatAmountSnapshot     Decimal?
+  commissionBaseSnapshot Decimal? // the seller-order customerPayableTotal the % was taken on
+
+  // ORDER_COMMISSION: goes ELIGIBLE at deliveredAt + returnWindowHours.
+  eligibleAt  DateTime?
+  deliveredAt DateTime?
+
+  // "YYYY-MM" of the payout batch. Set when the row becomes ELIGIBLE.
+  payoutMonth  String?
+  settlementId String?
+  settlement   BaSettlement? @relation(fields: [settlementId], references: [id])
+
+  reversedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([baId, status])
+  @@index([sourceUserId])
+  @@index([sourceSellerOrderId])
+  @@index([status, payoutMonth])
+}
+
+// Repurposed from an unused per-period stub: the monthly payout batch.
+model BaSettlement {
+  id   String                   @id @default(cuid())
+  baId String
+  ba   BusinessAssociateProfile @relation(fields: [baId], references: [id])
+
+  month String // "YYYY-MM" — the payout cycle (runs on the last day of that month)
+
+  totalAmount Decimal // sum of the BaEarning rows in this batch
+
+  // Bank details snapshotted at payout time so a later Form-2 edit never
+  // rewrites what a past payout was sent to.
+  bankSnapshot Json
+
+  status          String    @default("PENDING") // PENDING | PAID
+  transferredById String?
+  transferredAt   DateTime?
+  note            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  earnings BaEarning[]
+
+  @@unique([baId, month])
+  @@index([status])
+}
+
+// Per-seller / per-customer-type BA commission rate. Versioned,
+// most-specific-wins resolution (mirrors SettlementRateConfig):
+//   (sellerId, customerType) > (sellerId, null) > (null, customerType) > (null, null)
+// The (null, null) row is the global default (seeded at 2%).
+model BaRateConfig {
+  id                String         @id @default(cuid())
+  label             String
+  sellerId          String?
+  seller            SellerProfile? @relation(fields: [sellerId], references: [id])
+  customerType      UserRole? // CUSTOMER | DEALER — which buyer this rate applies to
+  commissionPercent Decimal
+  isActive          Boolean        @default(true)
+  isDemo            Boolean        @default(true)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@index([sellerId, customerType, isActive])
+}
+
+// True singleton (like SiteSettings) — the configurable flat BA amounts.
+model BaSettings {
+  id                       String   @id @default("singleton")
+  registrationAmount       Decimal  @default(50) // paid when a user registers with a BA code
+  dealerSignupAmount       Decimal  @default(50) // paid when a referred user creates a dealer account directly
+  dealerApprovalAmount     Decimal  @default(50) // paid when a referred user's dealer application is approved
+  defaultCommissionPercent Decimal  @default(2) // fallback when no BaRateConfig row matches
+  returnWindowHours        Int      @default(48) // delay after delivery before an ORDER_COMMISSION earning goes ELIGIBLE
+  updatedAt                DateTime @updatedAt
+}
+
+enum ProposedOrderStatus {
+  AWAITING_REFEREE // BA submitted; the referred user must approve / reject / customize
+  APPROVED // referred user approved — a real order was placed from it
+  REJECTED // referred user rejected — stock released
+  CUSTOMIZED // referred user chose to edit — items moved to their cart, this record closed
+  EXPIRED // reserved — no auto-expiry yet per spec
+  CANCELLED // BA or admin cancelled before the referee acted
+}
+
+// A BA-placed "order on behalf of a referred user" awaiting that user's
+// approval. Stock is reserved at creation and released if it does not
+// convert. COD only, CUSTOMER referees only.
+model ProposedOrder {
+  id   String                   @id @default(cuid())
+  baId String
+  ba   BusinessAssociateProfile @relation(fields: [baId], references: [id])
+
+  refereeUserId String
+  refereeUser   User   @relation("ProposedOrderReferee", fields: [refereeUserId], references: [id])
+
+  status ProposedOrderStatus @default(AWAITING_REFEREE)
+
+  // Delivery address the BA picked or typed — snapshot only; saved into the
+  // referee's address book only if/when they approve.
+  addressSnapshot Json
+
+  // Frozen pricing summary for display (per-seller breakdown + grand total).
+  pricingSnapshot Json
+  grandTotal      Decimal
+
+  checkoutGroupId String? // set once APPROVED — the real CheckoutGroup created
+
+  note      String?
+  decidedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items ProposedOrderItem[]
+
+  @@index([refereeUserId, status])
+  @@index([baId, status])
+}
+
+model ProposedOrderItem {
+  id              String        @id @default(cuid())
+  proposedOrderId String
+  proposedOrder   ProposedOrder @relation(fields: [proposedOrderId], references: [id], onDelete: Cascade)
+
+  productId    String
+  variantId    String?
+  sellerId     String
+  productName  String
+  variantLabel String?
+  sku          String?
+  quantity     Int
+  unitPrice    Decimal // locked at proposal time
+  lineTotal    Decimal
+
+  stockReservationId String? // the StockAdjustment reservation row, released if the proposal doesn't convert
+}
+
+model AdminProfile {
+  id                String  @id @default(cuid())
+  userId            String  @unique
+  user              User    @relation(fields: [userId], references: [id])
+  // Superseded by Role/RolePermission below — kept until a later cleanup
+  // migration drops these, so nothing reading them mid-rollout breaks.
+  roleName          String // e.g. "Super Admin", "Support Staff"
+  modulePermissions Json // e.g. { "orders": true, "products": true, "reports": false }
+  // Nullable only until the seed/backfill step sets every existing admin to
+  // the seeded "Super Admin" role — see packages/auth/src/permissions.ts's
+  // hasPermission(), which fails CLOSED (no role = no access), unlike the
+  // legacy modulePermissions above which fails open.
+  roleId            String?
+  role              Role?   @relation(fields: [roleId], references: [id])
+}
+
+// Dynamically creatable by a super-admin (a "manage roles & employees"
+// permission gates this, not a hardcoded check — see RolePermission).
+// isSystem protects the seeded "Super Admin" role from edit/delete through
+// the UI.
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique // "Super Admin", "Sales Agent"
+  description String?
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  permissions   RolePermission[]
+  adminProfiles AdminProfile[]
+  staffProfiles StaffProfile[]
+}
+
+// One row per granted (module, action) pair for a Role. Absence of a row
+// means not granted (fail-closed — see hasPermission()). `module` is a
+// plain string, not an enum, matching the existing informal moduleKey
+// convention (e.g. "pos" in apps/dashboard/src/lib/pos-guard.ts) so a new
+// gated module never needs a schema migration, only new rows.
+model RolePermission {
+  id      String           @id @default(cuid())
+  roleId  String
+  role    Role             @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  module  String
+  action  PermissionAction
+  granted Boolean          @default(true)
+
+  @@unique([roleId, module, action])
+  @@index([roleId])
+}
+
+// Mirrors SellerProfile's 1:1-off-User pattern exactly. A STAFF user's Role
+// assignment lives here, never on AdminProfile — a person is either a full
+// admin account or a restricted employee account, never both.
+model StaffProfile {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  roleId    String
+  role      Role     @relation(fields: [roleId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DeliveryManProfile {
+  id             String        @id @default(cuid())
+  userId         String        @unique
+  user           User          @relation(fields: [userId], references: [id])
+  sellerId       String
+  seller         SellerProfile @relation(fields: [sellerId], references: [id])
+  identityDocUrl String?
+  isOnline       Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+
+  // Phase 4 note: per-order delivery-man assignment is Phase 8 scope (see
+  // BUILD_PHASES.md) — Phase 4's mock logistics workflow is pickup-point +
+  // courier/transport based, not delivery-man based, so there is
+  // deliberately no relation back to SellerOrder here yet.
+  ratings DeliveryManRating[]
+}
+
+// ---------------------------------------------------------------------------
+// 2. Customer address book (Phase 4 — replaces the Phase 0 generic
+// shipping/billing `Address` placeholder, which had zero rows and zero
+// application code referencing it; this is a redesign, not a data
+// migration). Indian-address-shaped fields per Phase 4 spec §C1.
+// ---------------------------------------------------------------------------
+
+enum AddressKind {
+  HOME
+  FARM
+  SHOP
+  OFFICE
+  OTHER
+}
+
+model CustomerAddress {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id])
+  fullName    String
+  mobile      String
+  altMobile   String?
+  line1       String
+  line2       String?
+  landmark    String?
+  cityTown    String // village, town or city
+  // Nullable because the legacy migration imports the old `address` free-text
+  // blob (village/taluka/district/pincode all run together) verbatim into
+  // line1 without parsing it out — district stays blank for migrated
+  // addresses until the customer fills it in via the address-edit form.
+  district    String?
+  state       String
+  // Normalized state, used the same way as DealerProfile.stateId: matched
+  // against a dealer's verified state at checkout so a dealer can never
+  // bypass their approved state by typing a different one into a new
+  // address (see packages/orders' checkout validation). Nullable/free-text
+  // `state` above is kept for display and for customers, who may use any
+  // supported state.
+  stateId     String?
+  indianState IndianState? @relation(fields: [stateId], references: [id])
+  pincode     String // validated against the Indian PIN code format server-side
+  addressType AddressKind  @default(HOME)
+  isDefault   Boolean      @default(false)
+  // Preserves the legacy `shipping_addresses.is_billing` flag from the old
+  // site. Additive only — no checkout changes, no new
+  // OrderAddressSnapshot fields, no new UI; the checkout flow still
+  // collects a single delivery address.
+  isBilling   Boolean      @default(false)
+  // Old `shipping_addresses.id` from the legacy site, set only for
+  // migrated addresses. Same re-runnability rationale as User.legacyId.
+  legacyId    String?      @unique
+  // Reserved for a future map-pin feature — not populated or required in
+  // Phase 4.
+  latitude    Float?
+  longitude   Float?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  // Deliberately NO relation to CheckoutGroup/OrderAddressSnapshot: an order
+  // snapshots the address fields it needs at checkout time (see
+  // OrderAddressSnapshot below) precisely so that editing or deleting this
+  // row later can never change a past order's recorded delivery address.
+}
+
+// ---------------------------------------------------------------------------
+// 3. Catalog (Phase 3) — fixed 3-level category hierarchy, attribute-driven
+// customer/dealer variants, and separate customer/dealer product configuration.
+//
+// This replaces the Phase 0 placeholder catalog models (self-referential
+// Category, generic audience-keyed ProductPricing/ProductVariant, unused
+// Tag) — none of those had any rows, so this is a clean redesign, not a
+// data migration. See PHASE_3_PRODUCT_CATALOG.md-style notes in
+// packages/catalog for the business rules layered on top of this shape.
+// ---------------------------------------------------------------------------
+
+model Category {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  imageUrl  String?
+  // A single emoji shown in the storefront category ribbon and category
+  // pages (Homepage redesign, phase A). Nullable in the DB for rows that
+  // predate it; the admin category form makes it required going forward.
+  emoji     String?
+  // Short descriptive copy shown on the category's own storefront page,
+  // between the "Shop in {category}" heading and the product grid.
+  // Nullable/additive — a category with no description just renders
+  // without that paragraph, same convention as imageUrl/emoji above.
+  description String?
+  position  Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subCategories Subcategory[]
+  products      Product[]
+  translations  CategoryTranslation[]
+
+  homepageAsset            CategoryHomepageAsset?
+  merchandisingCollections MerchandisingCollection[]
+  promotionalAssets        PromotionalAsset[]
+}
+
+// Must belong to exactly one Category. Slugs are unique across all
+// subcategories (not scoped per-category) — simpler URLs, and "duplicate
+// slug" is still a real constraint at this level.
+model Subcategory {
+  id         String   @id @default(cuid())
+  name       String
+  slug       String   @unique
+  imageUrl   String?
+  // See Category.description's doc comment — same convention, one level down.
+  description String?
+  position   Int      @default(0)
+  isActive   Boolean  @default(true)
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  subSubCategories SubSubCategory[]
+  products         Product[]
+  translations     SubcategoryTranslation[]
+
+  merchandisingCollections MerchandisingCollection[]
+}
+
+// Must belong to exactly one Subcategory (which already belongs to a
+// Category) — the fixed-depth-3 hierarchy stops here, no further nesting.
+model SubSubCategory {
+  id            String      @id @default(cuid())
+  name          String
+  slug          String      @unique
+  imageUrl      String?
+  // See Category.description's doc comment — same convention, one level down.
+  description   String?
+  position      Int         @default(0)
+  isActive      Boolean     @default(true)
+  subCategoryId String
+  subCategory   Subcategory @relation(fields: [subCategoryId], references: [id])
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  products     Product[]
+  translations SubSubCategoryTranslation[]
+}
+
+// Per-language name overrides for the 3-level category hierarchy. English
+// lives on the row itself and is the source + fallback: a translation row
+// supplies one non-English language, and a null/blank `name` falls back to
+// the English column at read time (see resolveCategoryName in
+// packages/catalog/src/category-content.ts). Mirrors ProductTranslation.
+model CategoryTranslation {
+  id          String   @id @default(cuid())
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  language    Language
+  name        String?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([categoryId, language])
+  @@index([categoryId])
+}
+
+model SubcategoryTranslation {
+  id            String      @id @default(cuid())
+  subCategoryId String
+  subCategory   Subcategory @relation(fields: [subCategoryId], references: [id], onDelete: Cascade)
+  language      Language
+  name          String?
+  description   String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@unique([subCategoryId, language])
+  @@index([subCategoryId])
+}
+
+model SubSubCategoryTranslation {
+  id               String         @id @default(cuid())
+  subSubCategoryId String
+  subSubCategory   SubSubCategory @relation(fields: [subSubCategoryId], references: [id], onDelete: Cascade)
+  language         Language
+  name             String?
+  description      String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([subSubCategoryId, language])
+  @@index([subSubCategoryId])
+}
+
+// Phase 3 fix: brands can now be submitted by a seller (starts PENDING,
+// visible/selectable only to that seller once APPROVED) or created
+// directly by an admin (ownerSellerId null = global, immediately usable
+// by any seller). Deliberately one `status` field, not a separate
+// isActive flag — SUSPENDED/INACTIVE/REJECTED already cover "not usable
+// right now" without a second source of truth to keep in sync.
+model Brand {
+  id               String            @id @default(cuid())
+  name             String            @unique
+  slug             String            @unique
+  imageUrl         String?
+  status           ApplicationStatus @default(APPROVED)
+  rejectionReason  String?
+  ownerSellerId    String? // null = global/admin-owned; set = only that seller may use it once APPROVED
+  ownerSeller      SellerProfile?    @relation(fields: [ownerSellerId], references: [id])
+  // Homepage "Shop by Brand" ordering (Complete Design/Admin Spec §7.8) —
+  // null = not featured on the homepage; set = shown, ordered ascending.
+  // Only meaningful for APPROVED brands; storefront resolution filters on
+  // status itself, not on this field being set.
+  homepagePosition Int?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  products Product[]
+}
+
+// Same ownership/approval shape as Brand — see that model's doc comment.
+model Manufacturer {
+  id              String            @id @default(cuid())
+  name            String            @unique
+  slug            String            @unique
+  imageUrl        String?
+  status          ApplicationStatus @default(APPROVED)
+  rejectionReason String?
+  ownerSellerId   String?
+  ownerSeller     SellerProfile?    @relation(fields: [ownerSellerId], references: [id])
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  products Product[]
+}
+
+// Homepage redesign, phase B (#5). Admin-curated "shop by crop" master —
+// a flat list, each entry a crop the catalogue sells inputs for (Tomato,
+// Cotton, Paddy, …). `emoji` is the storefront placeholder shown in the
+// single-line homepage strip and on the crop landing page until a real
+// `imageUrl` is uploaded; the admin form requires the emoji, image is
+// optional. Many-to-many with Product — a product can be tagged with any
+// number of crops, purely for merchandising/discovery (no eligibility or
+// pricing effect).
+model Crop {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  slug      String   @unique
+  emoji     String?
+  imageUrl  String?
+  position  Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products Product[] @relation("ProductCrops")
+}
+
+// Homepage redesign, phase B (#6). Same shape and purpose as Crop, for the
+// separate single-line "shop by pest & disease" strip — entries name a
+// pest or disease the catalogue sells a remedy for (Aphids, Leaf curl
+// virus, Stem borer, …).
+model PestDisease {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  slug      String   @unique
+  emoji     String?
+  imageUrl  String?
+  position  Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products Product[] @relation("ProductPestsDiseases")
+}
+
+// Normalized Indian state master (Phase 3 fix — DealerProfile.state was
+// free text; kept as-is for back-compat, this is the new source of truth
+// for product-availability matching against a dealer's own state).
+model IndianState {
+  id        String   @id @default(cuid())
+  code      String   @unique // e.g. "MH"
+  name      String   @unique // e.g. "Maharashtra"
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  customerAvailableProducts         Product[]                 @relation("ProductCustomerStates")
+  dealerAvailableProducts           Product[]                 @relation("ProductDealerStates")
+  dealers                           DealerProfile[]
+  customers                         User[]
+  deliveryRequests                  SellerProductRequest[]
+  customerAddresses                 CustomerAddress[]
+  licenceSubmissionsAsCustomerState SellerLicenceSubmission[] @relation("SellerLicenceCustomerStates")
+  licenceSubmissionsAsDealerState   SellerLicenceSubmission[] @relation("SellerLicenceDealerStates")
+  sellingSellers                    SellerProfile[]           @relation("SellerSellingStates")
+}
+
+// Reusable attribute master (Size, Color, Fabric, ...) — this defines only
+// the attribute NAME, never hardcode a specific attribute as its own
+// column, new attributes need no schema change, just a new row here.
+//
+// Phase 3 fix: attribute *values* are NOT defined here anymore — they used
+// to be a shared global list (ProductAttributeValue), which meant two
+// unrelated products picking "Size" both drew from the exact same value
+// pool. Values are now scoped to the individual product that uses them
+// (see ProductVariantAttributeValue below); this model only ever answers
+// "what attributes exist to choose from."
+model ProductAttribute {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  slug      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  productValues ProductVariantAttributeValue[]
+}
+
+// A product-specific attribute value — e.g. product X's "Size" values are
+// S/M/L, product Y's "Size" values are 500ml/1L. Scoped by (productId,
+// attributeId) so two products never share rows, and safely reorderable/
+// renameable/removable per product without touching any other product.
+model ProductVariantAttributeValue {
+  id          String           @id @default(cuid())
+  productId   String
+  product     Product          @relation(fields: [productId], references: [id])
+  attributeId String
+  attribute   ProductAttribute @relation(fields: [attributeId], references: [id])
+  value       String // e.g. "S", "Red", "500 ml"
+  slug        String
+  position    Int              @default(0)
+  isActive    Boolean          @default(true)
+
+  variantValues ProductVariantValue[]
+
+  @@unique([productId, attributeId, value])
+  @@unique([productId, attributeId, slug])
+}
+
+enum ProductType {
+  PHYSICAL
+  DIGITAL
+}
+
+// Which side(s) of the marketplace this product is for — determines which
+// of ProductCustomerConfig/ProductDealerConfig must exist (enforced in
+// packages/catalog, not the DB: Prisma has no conditional-required
+// relation). Distinct from Product.customerVisible/dealerVisible, which are
+// independent display toggles layered on top of this classification.
+enum ProductAudience {
+  CUSTOMER_ONLY
+  DEALER_ONLY
+  BOTH_CUSTOMER_AND_DEALER
+}
+
+enum BaseUnit {
+  G
+  KG
+  ML
+  L
+  PIECE
+}
+
+// Phase 3 fix: selling price is no longer entered directly — it's always
+// server-computed from mrp + discountType + discountValue (see
+// packages/validators/src/pricing.ts:calculateSellingPrice). NONE means
+// sellingPrice === mrp.
+enum DiscountType {
+  NONE
+  FLAT
+  PERCENTAGE
+}
+
+enum ShippingCalcMode {
+  INCLUDE_WITH_PRODUCT
+  EXCLUDE_WITH_PRODUCT
+}
+
+// Whether Product.taxPercent is already baked into the selling price the
+// seller typed, or should be added on top of it. Set per sellable unit —
+// a simple (no-variant) product's customer/dealer config, or each
+// variant individually — never once for the whole product, since a
+// seller may want a different convention for their customer vs dealer
+// pricing, or between individual variants of the same product. Defaults
+// to INCLUDE_WITH_PRICE for every existing and new row (spec: "make every
+// product's dropdown set to included with tax for now"). NOTE: this is a
+// data-capture field only for now — checkout's actual tax math
+// (packages/orders/src/checkout-draft.ts) still always adds
+// sellingPrice * taxPercent / 100 on top regardless of this value; wiring
+// that up is a separate, deliberately deferred step (see this field's
+// PR/commit message).
+enum TaxCalcMode {
+  INCLUDE_WITH_PRICE
+  EXCLUDE_WITH_PRICE
+}
+
+// How the seller entered pricing on the product form. SELLING_PRICE (the
+// default and the only pre-existing behaviour) = the seller typed a
+// selling price / MRP+discount directly. NET_PAYABLE = the seller typed
+// the amount they want to net after settlement deductions (commission,
+// logistics, collection charge, their taxes, TCS/TDS); the form/server
+// back-solves the selling price from it (see
+// packages/validators/src/net-payable.ts) and stores it the normal way
+// via mrp + discountType/discountValue, so every downstream reader
+// (catalogue, checkout, settlement) is completely unaffected. The
+// seller-entered figure itself is kept on each sellable unit's
+// netPayableAmount purely so the edit form can reopen in the same mode.
+enum PriceEntryMode {
+  SELLING_PRICE
+  NET_PAYABLE
+}
+
+// One lifecycle per product — deliberately NOT mixed with stock status
+// (see ProductStockStatus below) or with a separate "approval" enum.
+enum ProductLifecycleStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  SUSPENDED
+  INACTIVE
+}
+
+// Phase 3 scope: a display flag only — no stock movement/ledger yet.
+enum ProductStockStatus {
+  NOT_TRACKED
+  IN_STOCK
+  OUT_OF_STOCK
+}
+
+// Admin-manageable editorial badge tone — mirrors packages/catalog/src/
+// badge-resolution.ts's BadgeTone union exactly (4 values, no "neutral":
+// a product card badge is always one of these).
+enum ProductBadgeTone {
+  SUCCESS
+  WARNING
+  DANGER
+  INFO
+}
+
+// Preserves the pre-existing priority split in badge-resolution.ts: DEAL
+// was always resolved into the 2nd-priority "deal" slot, never the 4th-
+// priority "editorial" slot that BEST_SELLER/NEW used — this field lets
+// that distinction survive the move from a hardcoded 3-value enum to an
+// admin-manageable table, instead of collapsing "Deal" into the same
+// priority bucket as every other editorial badge (a real behavior change
+// this migration must not introduce).
+enum EditorialBadgeKind {
+  EDITORIAL
+  DEAL
+}
+
+// Admin → Site Settings-managed badge definitions (spec item #3) —
+// replaces the old hardcoded ProductBadgeType enum. Deactivating (not
+// hard-deleting) is how an in-use badge is retired: existing
+// Product.editorialBadgeId assignments must keep loading correctly even
+// after their badge is deactivated (see reconcileEditorialBadgeAssignment
+// in packages/catalog/src/editorial-badges.ts), so nothing here cascades
+// on deactivate. Hard delete is only permitted when zero products
+// reference the badge (assertEditorialBadgeDeletable).
+model EditorialBadge {
+  id        String             @id @default(cuid())
+  name      String
+  slug      String             @unique
+  tone      ProductBadgeTone   @default(SUCCESS)
+  kind      EditorialBadgeKind @default(EDITORIAL)
+  isActive  Boolean            @default(true)
+  position  Int                @default(0)
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  products Product[]
+
+  @@index([position])
+}
+
+// AUTOMATIC = derive availability-badge text from stockStatus/eligibility
+// at render time; MANUAL = admin-fixed availabilityBadgeText overrides it;
+// OFF = never show an availability badge for this product.
+enum ProductAvailabilityBadgeMode {
+  AUTOMATIC
+  MANUAL
+  OFF
+}
+
+model Product {
+  id       String         @id @default(cuid())
+  sellerId String? // null = in-house/admin product
+  seller   SellerProfile? @relation(fields: [sellerId], references: [id])
+
+  name                  String
+  slug                  String                       @unique
+  sku                   String                       @unique
+  hsnCode               String // text, not numeric — leading zeroes may matter
+  // Single tax rate for the whole product, shared by every audience/
+  // variant — deliberately NOT split per audience like hsnCode is
+  // (ProductCustomerConfig/ProductDealerConfig used to each carry their
+  // own taxPercent; consolidated here on product decision so customer and
+  // dealer always charge the identical GST rate). Existing products were
+  // backfilled with MAX(old customer tax, old dealer tax) at migration
+  // time. A variant never carries its own tax rate either — see
+  // packages/orders/src/pricing-resolution.ts's resolveAudienceConfig.
+  taxPercent            Decimal                      @default(0)
+  // See PriceEntryMode's doc comment. A product-level flag (the seller
+  // picks the mode once at the top of the form); the per-unit
+  // netPayableAmount values on the configs/variants are only meaningful
+  // when this is NET_PAYABLE.
+  priceEntryMode        PriceEntryMode               @default(SELLING_PRICE)
+  shortDescription      String
+  description           String
+  ingredients           String?
+  howToUse              String?
+  dosageInstructions    String?
+  technicalInfo         String?
+  // Product-card fields (additive — Product Card Design Spec §Admin Panel
+  // Controls). subtitle is the card's "small dynamic subtitle" row, hidden
+  // when absent. ratingAverage/ratingCount are a denormalized cache of
+  // approved ProductReview rows, recomputed only by
+  // packages/catalog/src/ratings.ts:recomputeProductRating() — never
+  // computed inline in a catalogue query, matching this schema's existing
+  // server-computed-field convention (see sellingPrice/shippingCost).
+  subtitle              String?
+  editorialBadgeId      String?
+  editorialBadge        EditorialBadge?              @relation(fields: [editorialBadgeId], references: [id])
+  deliveryBadgeEnabled  Boolean                      @default(false)
+  deliveryBadgeText     String? // falls back to SiteSettings.defaultDeliveryBadgeText if enabled but blank
+  availabilityBadgeMode ProductAvailabilityBadgeMode @default(AUTOMATIC)
+  availabilityBadgeText String? // used only when availabilityBadgeMode = MANUAL
+  ratingAverage         Decimal?                     @db.Decimal(2, 1)
+  ratingCount           Int                          @default(0)
+
+  manufacturerId String?
+  manufacturer   Manufacturer? @relation(fields: [manufacturerId], references: [id])
+  brandId        String?
+  brand          Brand?        @relation(fields: [brandId], references: [id])
+
+  categoryId       String
+  category         Category        @relation(fields: [categoryId], references: [id])
+  subCategoryId    String?
+  subCategory      Subcategory?    @relation(fields: [subCategoryId], references: [id])
+  subSubCategoryId String?
+  subSubCategory   SubSubCategory? @relation(fields: [subSubCategoryId], references: [id])
+
+  productType                ProductType     @default(PHYSICAL)
+  audience                   ProductAudience
+  baseUnit                   BaseUnit
+  packageSize                String // e.g. "500 ml", "1 kg" — display label, distinct from baseUnit/variant/weight
+  searchTags                 String[]
+  featuredPosition           Int?
+  customerVisible            Boolean         @default(true)
+  dealerVisible              Boolean         @default(true)
+  // Diagnostic-only timestamp — set every time reconcileProductLicenceCompliance
+  // evaluates this product (restrict OR restore OR no-op), regardless of
+  // whether anything changed. Never read by any eligibility/enforcement
+  // logic itself; purely so the admin compliance diagnostic panel can show
+  // "last checked" instead of leaving admins guessing whether the system
+  // has caught up with a recent licence change.
+  licenceComplianceCheckedAt DateTime?
+
+  lifecycleStatus ProductLifecycleStatus @default(DRAFT)
+  rejectionReason String?
+  stockStatus     ProductStockStatus     @default(NOT_TRACKED)
+
+  primaryImageUrl String
+  videoUrl        String? // approved video URL (e.g. YouTube embed link) — optional
+
+  // Legacy product-catalog migration (see migrate-legacy-products.ts): old
+  // products.id, unique per product so a re-run upserts instead of
+  // duplicating. Distinct from ProductVariant/ProductCustomerConfig/
+  // ProductDealerConfig's legacyProductId+legacyVariantType pair — those
+  // exist specifically for order-linking granularity (a legacy product
+  // commonly has several variants); this one is simpler, purely for
+  // making the Product row itself idempotently re-importable.
+  legacyId String? @unique
+
+  metaTitle       String?
+  metaDescription String?
+  metaImageUrl    String?
+  canonicalUrl    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Phase 3 fix: crop/problem applicability was removed (see BUILD_PHASES.md
+  // notes) — this project isn't building crop/problem-based recommendation
+  // features, and the concept added form complexity with no consumer.
+  //
+  // Selling-licence module: split from a single `availableStates` into two
+  // independent lists — Customer and Dealer eligibility (both licence- and
+  // non-licence-driven) are never required to match (see
+  // packages/catalog/src/licence-eligibility.ts). Empty = nationwide, same
+  // convention as before (see product-submission.ts normalizeStateSelection).
+  customerAvailableStates IndianState[] @relation("ProductCustomerStates")
+  dealerAvailableStates   IndianState[] @relation("ProductDealerStates")
+
+  // Homepage redesign, phase B — merchandising/discovery tags only (no
+  // eligibility or pricing effect). Set from the product form's
+  // "Category, brand & classification" section.
+  crops         Crop[]        @relation("ProductCrops")
+  pestsDiseases PestDisease[] @relation("ProductPestsDiseases")
+
+  images                 ProductImage[]
+  translations           ProductTranslation[]
+  customerConfig         ProductCustomerConfig?
+  dealerConfig           ProductDealerConfig?
+  variants               ProductVariant[]
+  variantAttributeValues ProductVariantAttributeValue[]
+  reviews                ProductReview[]
+  requests               SellerProductRequest[]
+  cartItems              CartItem[]
+  wishlistItems          WishlistItem[]
+  dealsOfTheDay          DealOfTheDay[]
+  merchandisingItems     MerchandisingItem[]
+  complianceReviews      ProductComplianceReview[]
+  stockAdjustments       StockAdjustment[]
+  restockSubscriptions   RestockSubscription[]
+}
+
+model ProductImage {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  url       String
+  altText   String?
+  position  Int     @default(0)
+  isActive  Boolean @default(true)
+}
+
+// Storefront content languages. EN is the source language and always lives
+// on the base row (Product columns, PromotionalAsset columns); the other
+// four are overrides carried in ProductTranslation / selected on
+// PromotionalAsset. Keep in sync with apps/web/src/i18n/config.ts.
+enum Language {
+  EN
+  HI
+  MR
+  TE
+  TA
+}
+
+// Per-language overrides for a Product's rich-text description fields.
+// English lives on the Product row itself and is the source + fallback: a
+// row here supplies one non-English language, and any field left null falls
+// back to the Product's English value at read time (see
+// packages/catalog/src/product-content.ts).
+model ProductTranslation {
+  id                 String   @id @default(cuid())
+  productId          String
+  product            Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  language           Language
+  name               String?
+  shortDescription   String?
+  description        String?
+  ingredients        String?
+  howToUse           String?
+  dosageInstructions String?
+  technicalInfo      String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([productId, language])
+  @@index([productId])
+}
+
+// One-to-one with Product, present only when audience includes CUSTOMER.
+model ProductCustomerConfig {
+  productId         String           @id
+  product           Product          @relation(fields: [productId], references: [id])
+  // Sellable-unit identity for a simple (no-variant) product's customer
+  // side — mirrors how a variant already carries its own `sku`. Nullable
+  // because existing rows are deliberately left unbackfilled (spec: SKU
+  // suffix convention applies going forward only); a null value falls
+  // back to the parent Product.sku at every read site until this product
+  // is next saved through the form, which requires and normalizes it
+  // (must end in "-cus", see normalizeAudienceSku in @kisan4u/validators).
+  sku               String?          @unique
+  // Unlike sku, existing rows ARE backfilled from Product.hsnCode at
+  // migration time (copy, not a rename) — HSN carries no audience suffix
+  // and diverging it per audience is the whole point of this column, so
+  // there's no reason to leave it null when a perfectly good starting
+  // value already exists on the parent product.
+  hsnCode           String?
+  mrp               Decimal
+  sellingPrice      Decimal
+  minOrderQty       Int              @default(1)
+  currentStock      Int              @default(0)
+  // Inventory-management thresholds (distinct from minOrderQty above,
+  // which is a customer-facing "smallest quantity you may order" rule).
+  // These gate the stock-status/row-colour computation in
+  // packages/catalog/src/inventory.ts (computeStockStatus) — never
+  // percentages of currentStock, always independent absolute values.
+  // Defaults 5/10 match the safe backfill used for pre-existing rows.
+  minStockQty       Int              @default(5)
+  reorderLevel      Int              @default(10)
+  discountType      DiscountType     @default(NONE)
+  discountValue     Decimal          @default(0)
+  // Seller-entered "amount I want to net after settlement deductions" —
+  // only set when the parent Product.priceEntryMode is NET_PAYABLE (null
+  // otherwise, and on every pre-existing row). Not read by pricing/
+  // settlement: sellingPrice/discountValue above are still the source of
+  // truth; this is kept only so the edit form can reopen in NET_PAYABLE
+  // mode showing the figure the seller actually typed. See
+  // packages/validators/src/net-payable.ts.
+  netPayableAmount  Decimal?
+  // Dimensions are metres (Decimal, precise); weight is whole grams (Int)
+  // — see ProductVariant's doc comment for why weight specifically is an
+  // integer, not a Decimal like the others.
+  height            Decimal?
+  breadth           Decimal?
+  length            Decimal?
+  weight            Int?
+  // Phase 3 fix: shipping cost is no longer a manually-entered value —
+  // it's always server-computed from `weight` against the active
+  // LogisticsPricingConfig (see packages/catalog/src/logistics-pricing.ts
+  // calculateShippingCostForWeight). Nullable (not @default(0)) so "no
+  // active logistics config yet" is a distinct, visible state from "this
+  // shipment really does cost ₹0" — a silent zero would hide a
+  // misconfiguration.
+  shippingCost      Decimal?
+  shippingCalcMode  ShippingCalcMode @default(INCLUDE_WITH_PRODUCT)
+  // See TaxCalcMode's doc comment — whether Product.taxPercent is already
+  // baked into `sellingPrice` above, or should be added on top of it.
+  taxCalcMode       TaxCalcMode      @default(INCLUDE_WITH_PRICE)
+  // Reward points earned on a purchase of this non-variant product's
+  // customer-side unit. Mirrors ProductVariant.loyaltyPoints (the
+  // variant-product equivalent) — this is the config-side home for the
+  // exact same concept when there's no ProductVariant row to put it on.
+  // Defaults to 0, not null: the points-earning logic itself doesn't
+  // exist yet (no wallet/ledger integration as of this field's
+  // introduction), so every row means "earns nothing" until that's built,
+  // never "unknown/unset".
+  loyaltyPoints     Int              @default(0)
+  // Legacy product-catalog migration (see migrate-legacy-products.ts, once
+  // written): only populated for a non-variant product imported from the
+  // old site — legacyProductId is the old products.id, legacyVariantType
+  // is always "" (never null) here since this config row has no real
+  // per-variant breakdown to distinguish. Same non-null-sentinel
+  // convention as RestockSubscription.variantId's doc comment explains:
+  // Postgres treats every NULL as distinct even inside a composite unique
+  // index, so a nullable legacyVariantType would silently let a rerun
+  // insert a duplicate row instead of updating this one.
+  legacyProductId   String?
+  legacyVariantType String?
+  // Inventory table's "Last updated" column/sort — this model had no
+  // timestamp field at all before the stock-management feature needed one.
+  updatedAt         DateTime         @updatedAt
+
+  @@unique([legacyProductId, legacyVariantType])
+  @@index([updatedAt])
+}
+
+// One-to-one with Product, present only when audience includes DEALER.
+// Deliberately a separate model from ProductCustomerConfig (not one shared
+// row keyed by audience) — customer and dealer pricing/packaging must never
+// be mixed or overwrite one another.
+model ProductDealerConfig {
+  productId         String           @id
+  product           Product          @relation(fields: [productId], references: [id])
+  // See ProductCustomerConfig's doc comment on sku/hsnCode — identical
+  // rules, dealer side (suffix "-dea", sku left null on existing rows,
+  // hsnCode backfilled from Product.hsnCode).
+  sku               String?          @unique
+  hsnCode           String?
+  mrp               Decimal
+  sellingPrice      Decimal
+  minOrderQty       Int              @default(1)
+  currentStock      Int              @default(0)
+  // See ProductCustomerConfig's doc comment on minStockQty/reorderLevel —
+  // identical inventory-threshold semantics, independent per audience
+  // config since customer/dealer stock pools are already separate here.
+  minStockQty       Int              @default(5)
+  reorderLevel      Int              @default(10)
+  discountType      DiscountType     @default(NONE)
+  discountValue     Decimal          @default(0)
+  // See ProductCustomerConfig.netPayableAmount's doc comment — identical
+  // convention, dealer side.
+  netPayableAmount  Decimal?
+  height            Decimal?
+  breadth           Decimal?
+  length            Decimal?
+  weight            Int?
+  shippingCost      Decimal?
+  shippingCalcMode  ShippingCalcMode @default(INCLUDE_WITH_PRODUCT)
+  // See ProductCustomerConfig's identical doc comment on taxCalcMode —
+  // same convention, dealer side.
+  taxCalcMode       TaxCalcMode      @default(INCLUDE_WITH_PRICE)
+  // See ProductCustomerConfig's identical doc comment on loyaltyPoints —
+  // same convention, dealer side.
+  loyaltyPoints     Int              @default(0)
+  // See ProductCustomerConfig's identical doc comment on
+  // legacyProductId/legacyVariantType — same convention, dealer side.
+  legacyProductId   String?
+  legacyVariantType String?
+  updatedAt         DateTime         @updatedAt
+
+  @@unique([legacyProductId, legacyVariantType])
+  @@index([updatedAt])
+}
+
+// A variant row belongs to exactly one audience's variant set — never
+// "both" — so this is a plain 2-value enum, distinct from the tri-state
+// Product.audience above.
+enum VariantAudience {
+  CUSTOMER
+  DEALER
+}
+
+// Attribute-driven, replaces the old generic optionLabel-based variant.
+// combinationKey is a deterministic, sorted join of this variant's
+// ProductVariantValue.attributeValueId set, computed by
+// packages/catalog's combinationKey() helper — it's what turns "no
+// duplicate variant combination per product+audience" into a real
+// database constraint instead of an app-only check.
+model ProductVariant {
+  id                String           @id @default(cuid())
+  productId         String
+  product           Product          @relation(fields: [productId], references: [id])
+  audience          VariantAudience
+  sku               String           @unique
+  // Nullable for the same reason as ProductCustomerConfig/
+  // ProductDealerConfig.hsnCode — backfilled by copying the parent
+  // Product.hsnCode at migration time, then free to diverge per variant
+  // going forward. Unlike sku, this carries no audience suffix (spec:
+  // "do not automatically add -cus or -dea to HSN").
+  hsnCode           String?
+  // Deliberately NO slug field — a variant is identified by id/SKU/
+  // combinationKey/its attribute values, never a public slug. Only the
+  // parent Product has one (Product.slug). A UI-only display label like
+  // "Size: M / Color: Green" is generated on the fly from the attribute
+  // values (see packages/catalog), never stored.
+  combinationKey    String
+  mrp               Decimal
+  // DEPRECATED — no longer read or written anywhere. Per-unit price (for a
+  // multi-piece "Case" variant) is now computed live instead of stored:
+  // this column was written once by the legacy-catalogue migration (case
+  // MRP ÷ case count) and never again by the ordinary admin product form,
+  // so it silently went stale/null for every product created since.
+  // packages/catalog/src/variant-compatibility.ts's computeUnitPrice()
+  // derives it live from `sellingPrice` ÷ the variant's own "Case"
+  // attribute value instead, so it's always in sync with the actual
+  // selling price everywhere it's shown. Column kept (not dropped) to
+  // avoid an unnecessary destructive migration on the shared database —
+  // safe to drop in a future cleanup pass.
+  perUnitMrp        Decimal?
+  discountType      DiscountType     @default(NONE)
+  discountValue     Decimal          @default(0)
+  // See ProductCustomerConfig.netPayableAmount's doc comment — identical
+  // convention, per variant row.
+  netPayableAmount  Decimal?
+  sellingPrice      Decimal
+  minOrderQty       Int              @default(1)
+  stockQty          Int              @default(0)
+  // See ProductCustomerConfig's doc comment on minStockQty/reorderLevel —
+  // identical inventory-threshold semantics at the variant level.
+  minStockQty       Int              @default(5)
+  reorderLevel      Int              @default(10)
+  // Reward points earned on a purchase of this variant. Nullable (unlike
+  // the config-side equivalent's @default(0)) since this field predates
+  // the legacy migration and already had rows in the wild before this
+  // convention was decided — treat null and 0 as equivalent ("earns
+  // nothing") at every read site, same reasoning as the config fields'
+  // doc comment on why 0 rather than null going forward.
+  loyaltyPoints     Int?
+  height            Decimal?
+  breadth           Decimal?
+  length            Decimal?
+  // Whole grams, never a fractional/floating kilogram value — matches the
+  // same precision reasoning as LogisticsWeightSlab's gram boundaries
+  // (see that model's doc comment): shipping-cost lookups compare this
+  // directly against slab boundaries, so it must be an exact integer.
+  weight            Int?
+  shippingCost      Decimal?
+  shippingCalcMode  ShippingCalcMode @default(INCLUDE_WITH_PRODUCT)
+  // See TaxCalcMode's doc comment — set per variant, not once for the
+  // whole product (unlike shippingCalcMode above, this carries no
+  // DEALER-only restriction; both audiences can independently choose).
+  taxCalcMode       TaxCalcMode      @default(INCLUDE_WITH_PRICE)
+  // Optional per-variant PRIMARY/cover image — mirrors Product.primaryImageUrl.
+  // A variant with no image of its own falls back to the product's
+  // primaryImageUrl at read time (see packages/catalog). Additional
+  // per-variant gallery images live in the `images` relation below
+  // (mirroring Product.images/ProductImage) — one plain column was
+  // enough while only a single image was ever needed (see git history),
+  // but a real gallery needs its own table the same way the product level
+  // already has one.
+  imageUrl          String?
+  imageAlt          String?
+  // Optional per-variant video, distinct from the parent Product's
+  // videoUrl — same fallback-to-product convention as imageUrl above.
+  videoUrl          String?
+  isActive          Boolean          @default(true)
+  // Product-card default/first-eligible variant selection (Product Card
+  // Design Spec §Variants). At most one row per (productId, audience) may
+  // be true — enforced in packages/catalog/src/variant-generation.ts, not
+  // a DB constraint, matching this schema's existing convention of
+  // enforcing some invariants (e.g. audience matching) app-side. The card
+  // falls back to the first isActive variant when no default is set or the
+  // marked default is ineligible for the current viewer.
+  isDefault         Boolean          @default(false)
+  // Legacy product-catalog migration (see migrate-legacy-products.ts):
+  // legacyProductId is the old products.id; legacyVariantType is
+  // "CUSTOMER:10Gmx1Nos" / "DEALER:10Gmx1Nos" — the old order_details.variant
+  // snapshot string, audience-prefixed. The prefix is required, not
+  // cosmetic: at least one real Katra product has the exact same variant
+  // string on both its customer and dealer side, which — without the
+  // prefix — collided on this composite key and silently corrupted the
+  // row (confirmed on a real run, not theoretical). "" (never null) for
+  // the rare legacy product with no real variant breakdown. Both columns
+  // together, not legacyProductId alone, are what let a later
+  // orders-migration phase resolve an old order_details row (which only
+  // carries product_id + that same variant string, never a stable
+  // variant-level id of its own — the old schema has no such id) to
+  // exactly this row; that phase must derive CUSTOMER/DEALER from the
+  // order's own context before building this key, since order_details
+  // never states it directly. Same non-null-sentinel convention as
+  // RestockSubscription.variantId's doc comment explains — a nullable
+  // legacyVariantType would let Postgres treat two rows as non-duplicates
+  // even with the same legacyProductId, breaking rerun idempotency.
+  legacyProductId   String?
+  legacyVariantType String?
+  createdAt         DateTime         @default(now())
+  // Inventory table's "Last updated" column/sort.
+  updatedAt         DateTime         @updatedAt
+
+  values        ProductVariantValue[]
+  images        VariantImage[]
+  requests      SellerProductRequest[]
+  cartItems     CartItem[]
+  dealsOfTheDay DealOfTheDay[]
+
+  @@unique([productId, audience, combinationKey])
+  @@unique([legacyProductId, legacyVariantType])
+  @@index([updatedAt])
+}
+
+/**
+ * Additional per-variant gallery images — mirrors ProductImage exactly, one level down. The variant's own primary/cover image stays on ProductVariant.imageUrl (see its doc comment), same split as Product.primaryImageUrl vs Product.images.
+ */
+model VariantImage {
+  id        String         @id @default(cuid())
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+  url       String
+  altText   String?
+  position  Int            @default(0)
+  isActive  Boolean        @default(true)
+
+  @@index([variantId])
+}
+
+model ProductVariantValue {
+  variantId        String
+  variant          ProductVariant               @relation(fields: [variantId], references: [id])
+  attributeValueId String
+  attributeValue   ProductVariantAttributeValue @relation(fields: [attributeValueId], references: [id])
+
+  @@id([variantId, attributeValueId])
+}
+
+// ---------------------------------------------------------------------------
+// Variant-level inventory management: stock-adjustment ledger + restock
+// subscriptions. See packages/catalog/src/inventory.ts for the single
+// choke-point service (recordStockChange) that writes every row here —
+// manual seller/admin edits AND order sale/cancellation deductions all
+// route through it, so this table is the one true history of every
+// quantity change regardless of source.
+// ---------------------------------------------------------------------------
+
+enum StockAdjustmentType {
+  MANUAL_ADD
+  MANUAL_CORRECTION
+  ORDER_SALE
+  ORDER_CANCELLATION_RESTORE
+  RETURN_RESTORE
+  ADMIN_CORRECTION
+  MIGRATION_OPENING_BALANCE
+}
+
+enum StockAdjustmentSource {
+  SELLER
+  ADMIN
+  ORDER
+  CANCELLATION
+  RETURN
+  MIGRATION
+}
+
+// Append-only — never updated or deleted, only inserted (same convention
+// as OrderStatusHistory). variantId is null for a non-variant product's
+// base/default-variant row — `audience` disambiguates which of
+// ProductCustomerConfig/ProductDealerConfig that refers to, since a
+// non-variant product may carry both simultaneously as two independent
+// stock pools. variantId deliberately carries NO foreign-key relation
+// (informational only, same convention as OrderItem.productId/variantId)
+// because a seller editing a product's variant list can delete a variant
+// row entirely (packages/catalog's syncVariants) — history must survive
+// that even though the live variant no longer exists.
+model StockAdjustment {
+  id        String          @id @default(cuid())
+  sellerId  String
+  // onDelete: Cascade — unlike relatedOrderId/variantId above, this IS a
+  // real enforced FK (a seller/product genuinely must exist for this row
+  // to make sense when written), but a hard product/seller delete only
+  // ever happens in test-fixture cleanup in practice (production never
+  // hard-deletes either — see lifecycleStatus-based soft states); letting
+  // that cascade away this row's own history is simpler and safer than
+  // forcing every test file that runs a real checkout to separately learn
+  // about and clean up this table.
+  seller    SellerProfile   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId String?
+  audience  VariantAudience
+
+  previousQty Int
+  changeQty   Int // signed: positive = added, negative = deducted
+  newQty      Int
+
+  adjustmentType StockAdjustmentType
+  sourceType     StockAdjustmentSource
+  reason         String?
+  // Informational only, same convention as variantId above — never an
+  // enforced FK, so this row survives even if the order is later purged.
+  relatedOrderId String?
+
+  performedByUserId String
+  performedByRole   UserRole
+  createdAt         DateTime @default(now())
+
+  @@index([productId, variantId])
+  @@index([sellerId])
+  @@index([createdAt])
+}
+
+enum RestockSubscriptionStatus {
+  ACTIVE
+  FULFILLED
+  CANCELLED
+}
+
+// One row per (user, product, variant, audience) — "Notify me when stock
+// is available". variantId uses an empty-string sentinel rather than
+// null for the non-variant case specifically because this table (unlike
+// StockAdjustment above) needs a real uniqueness guarantee: Postgres
+// unique indexes never treat two NULLs as duplicates, so a nullable
+// variantId would silently allow duplicate subscriptions for every
+// non-variant product. audience again disambiguates the non-variant
+// (variantId = "") case between the product's Customer and Dealer stock
+// pools.
+model RestockSubscription {
+  id        String          @id @default(cuid())
+  userId    String
+  user      User            @relation(fields: [userId], references: [id])
+  productId String
+  product   Product         @relation(fields: [productId], references: [id])
+  variantId String          @default("")
+  audience  VariantAudience
+
+  status       RestockSubscriptionStatus @default(ACTIVE)
+  subscribedAt DateTime                  @default(now())
+  notifiedAt   DateTime?
+  cancelledAt  DateTime?
+
+  @@unique([userId, productId, variantId, audience])
+  @@index([productId, variantId, audience, status])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 addition: "Request Seller" — a dealer enquiry, deliberately NOT
+// an order. No stock reservation, no price calculation, no payment, no
+// shipment — see packages/catalog/src/product-requests.ts. dealerId/
+// sellerId/productId/variantId are always server-derived (session for
+// dealerId, the product row for sellerId) and re-validated at creation
+// time — never trusted from client input — and deliveryAddress/
+// deliveryStateId are a per-request delivery preference that never writes
+// back to DealerProfile.
+// ---------------------------------------------------------------------------
+
+// PENDING = submitted, awaiting admin review — NOT yet visible to the
+// seller (see packages/catalog/src/product-requests.ts getSellerRequests*,
+// which filters to status NOT IN (PENDING, REJECTED)). APPROVED = admin has
+// sanitized/forwarded it to the seller. REJECTED = admin declined (terminal,
+// dealer sees rejectionReason, seller never sees the row at all).
+// VIEWED/RESPONDED/CLOSED are the seller's own progression, only reachable
+// after APPROVED. CANCELLED is dealer-initiated, from PENDING or APPROVED.
+enum SellerProductRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  VIEWED
+  RESPONDED
+  CLOSED
+  CANCELLED
+}
+
+model SellerProductRequest {
+  id        String          @id @default(cuid())
+  dealerId  String
+  dealer    DealerProfile   @relation(fields: [dealerId], references: [id])
+  sellerId  String
+  seller    SellerProfile   @relation(fields: [sellerId], references: [id])
+  productId String
+  product   Product         @relation(fields: [productId], references: [id])
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id])
+
+  // Public-safe identifier shown to the dealer and used in seller-facing
+  // views — never the raw cuid `id`, which is never displayed to either
+  // party as a "request number".
+  publicRequestNumber String @unique
+
+  quantity             Int
+  // Optional — when the dealer needs the product by; purely informational,
+  // never used to drive any automated logic. Safe to show the seller (see
+  // SELLER_SAFE_SELECT in product-requests.ts) — it carries no dealer
+  // identity, unlike deliveryAddress/note.
+  neededByDate         DateTime?
+  deliveryAddress      String
+  // Always server-derived from the dealer's own verified DealerProfile.stateId
+  // at creation time (see product-requests.ts createProductRequest) — never a
+  // client-editable choice. A request only exists because the product is
+  // unavailable for exactly this state.
+  deliveryStateId      String
+  deliveryState        IndianState @relation(fields: [deliveryStateId], references: [id])
+  // Raw dealer free-text requirement — admin-only, see schema doc block
+  // above. Must NEVER be selected/serialized in any seller-facing query.
+  note                 String?
+  // Admin-authored, sanitized version of `note` (or a fresh summary) that
+  // IS safe to forward to the seller. Set by admin during approval; null
+  // until then. This — never `note` — is what seller-facing queries select.
+  sellerVisibleSummary String?
+  // Admin-only working notes, never shown to dealer or seller.
+  adminNotes           String?
+  // Required when status = REJECTED; shown to the dealer, never the seller.
+  rejectionReason      String?
+
+  status    SellerProductRequestStatus @default(PENDING)
+  createdAt DateTime                   @default(now())
+  updatedAt DateTime                   @updatedAt
+
+  @@index([dealerId])
+  @@index([sellerId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 fix: logistics weight-slab master data only — admin defines price
+// slabs by shipment weight. NOT wired to checkout/orders/settlements yet
+// (see BUILD_PHASES.md); this is master data a later phase will consume.
+// Weight is stored in whole grams (never floating-point kilograms) so slab
+// continuity can be validated with plain integer comparisons — see
+// packages/catalog/src/logistics-pricing.ts.
+// ---------------------------------------------------------------------------
+
+model LogisticsPricingConfig {
+  id             String   @id @default(cuid())
+  maxWeightGrams Int
+  aboveMaxPrice  Decimal
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  slabs LogisticsWeightSlab[]
+}
+
+model LogisticsWeightSlab {
+  id               String                 @id @default(cuid())
+  configId         String
+  config           LogisticsPricingConfig @relation(fields: [configId], references: [id])
+  lowerWeightGrams Int
+  upperWeightGrams Int
+  price            Decimal
+  sortOrder        Int                    @default(0)
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  @@unique([configId, lowerWeightGrams])
+}
+
+// Phase 4 addition: the collection charge is a separate, always-seller-
+// borne charge (§G1/§H2 — distinct from transportation cost, never merged
+// into one generic figure) computed independently of payment method. If no
+// active config exists, packages/orders' charge calculator falls back to a
+// ₹0 collection charge rather than blocking checkout — unlike a missing
+// logistics slab (§J2), which does block checkout, because the collection
+// charge is a Kisan4u-internal accounting figure, not a customer-facing
+// shipping estimate.
+model CollectionChargeConfig {
+  id         String         @id @default(cuid())
+  label      String
+  chargeType ChargeCalcType
+  value      Decimal
+  minCharge  Decimal?
+  maxCharge  Decimal?
+  isActive   Boolean        @default(true)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+}
+
+// Split from a single legacy-inspired "Review" model per Phase 0 review:
+// product reviews and delivery-man ratings are now distinct models instead
+// of one model with two nullable, mutually-exclusive foreign keys.
+// PENDING = awaiting moderation (the only state a fresh WEBSITE review or
+// a not-yet-published MANUAL_OFFLINE entry starts in); APPROVED = public
+// and counted in the verified rating (when also verifiedPurchase);
+// REJECTED = moderator declined it (kept, never deleted, for audit —
+// unlike the old isApproved-boolean model this replaces, which could
+// only hard-delete); HIDDEN = was public, later unpublished without
+// being a "rejection" of the content itself (e.g. reported/stale).
+enum ReviewModerationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  HIDDEN
+}
+
+// WEBSITE = submitted by a signed-in customer/dealer through the
+// storefront review form, always eligibility-checked against a real
+// delivered order (see submitProductReview). MANUAL_OFFLINE = entered by
+// an admin on the customer's behalf from feedback collected elsewhere
+// (call centre, WhatsApp, ...) — never eligible for verifiedPurchase
+// unless separately linked to and validated against a real order.
+enum ReviewSource {
+  WEBSITE
+  MANUAL_OFFLINE
+}
+
+model ProductReview {
+  id                 String     @id @default(cuid())
+  productId          String
+  product            Product    @relation(fields: [productId], references: [id])
+  // Nullable — a MANUAL_OFFLINE review has no linked account to
+  // attribute it to. Every WEBSITE review always has one (enforced in
+  // submitProductReview, not the DB — Prisma has no conditionally-
+  // required column). The one-review-per-product constraint below only
+  // ever binds real accounts: Postgres treats each NULL as distinct, so
+  // multiple manual entries never collide with each other.
+  customerId         String?
+  customer           User?      @relation(fields: [customerId], references: [id])
+  // Display name for a MANUAL_OFFLINE review, since there's no
+  // customer.name to read live. A WEBSITE review's displayed name always
+  // comes from customer.name at render time — never stored here — so a
+  // signed-in customer can never submit a review under a different name.
+  manualCustomerName String?
+  // Where a MANUAL_OFFLINE review came from — e.g. "Call centre ticket
+  // #1234", "WhatsApp thread with +91XXXXXXXXXX" — admin/internal-audit
+  // only, never shown to a public visitor (see the storefront review
+  // query's select, which never reads this field).
+  sourceReference    String?
+  orderId            String? // informational only — no FK, order may be archived independently
+  // Real FK (unlike orderId above): the specific delivered line item this
+  // WEBSITE review is attached to. Set once at submission and never
+  // reassigned. Null for MANUAL_OFFLINE and for any legacy row from
+  // before this column existed.
+  orderItemId        String?
+  orderItem          OrderItem? @relation(fields: [orderItemId], references: [id])
+  rating             Int
+  comment            String?
+  attachmentUrl      String?
+  // Purchased-variant label snapshot at review time (e.g. "Size: 500 ml"),
+  // display-only — never used to resolve a live variant, so it stays
+  // accurate even if the variant is later edited or deactivated.
+  variantSnapshot    Json?
+
+  moderationStatus ReviewModerationStatus @default(PENDING)
+  source           ReviewSource           @default(WEBSITE)
+  // True only when orderItemId was verified at submission time to belong
+  // to a DELIVERED order this exact account owns (see
+  // submitProductReview) — never set for MANUAL_OFFLINE, never trusted
+  // from client input, never edited by an admin (moderation changes
+  // publication state, not this flag).
+  verifiedPurchase Boolean                @default(false)
+  // "The customer gave permission to publish" checkbox on the admin
+  // manual-review form — required before a MANUAL_OFFLINE review can be
+  // moderated to APPROVED (enforced in the moderation action).
+  consentConfirmed Boolean                @default(false)
+
+  moderationNote     String? // internal only, never shown publicly
+  moderatedByAdminId String? // informational, same convention as OrderStatusHistory.actorId — not a DB relation
+  moderatedAt        DateTime?
+  createdByAdminId   String? // set only for a MANUAL_OFFLINE row; who recorded it
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([customerId, productId])
+  @@index([productId])
+  @@index([moderationStatus])
+  @@index([orderItemId])
+}
+
+model DeliveryManRating {
+  id            String             @id @default(cuid())
+  deliveryManId String
+  deliveryMan   DeliveryManProfile @relation(fields: [deliveryManId], references: [id])
+  customerId    String
+  customer      User               @relation(fields: [customerId], references: [id])
+  orderId       String? // informational only — no FK
+  rating        Int
+  comment       String?
+  createdAt     DateTime           @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 4. Cart & Wishlist
+// ---------------------------------------------------------------------------
+
+// Phase 4 redesign: the Phase 0 placeholder CartItem predated the Phase 3
+// catalog rebuild (ProductCustomerConfig/ProductDealerConfig/ProductVariant)
+// and had zero rows and zero application code referencing it — safe to
+// redesign rather than migrate. productId/variantId are now real FKs (the
+// catalog they'd reference is stable/approved by the time anything is
+// addable to cart); sellerId is denormalized from product.sellerId at
+// add-time purely so the cart page and checkout split can group/query by
+// seller without an extra join — it is always re-derived from the product
+// on every mutation, never trusted as an input (see packages/orders).
+//
+// Deliberately NO `audience` column: which config (customer/dealer) and price
+// applies is resolved from the authenticated user's role on every read and
+// write, never stored, so a role change or price change is always reflected
+// live (see §B4 of the Phase 4 spec — price changes must never be served
+// from a stale snapshot). `priceAtAdd` exists only to detect and display a
+// "price changed" notice, never as the authoritative checkout price.
+//
+// No DB-level uniqueness on (userId, productId, variantId): Postgres
+// treats NULL variantId as distinct per row, which would let duplicate
+// "no-variant" lines slip past a naive unique index anyway. Preventing
+// duplicate lines (increment quantity instead of inserting) is enforced in
+// packages/orders' addToCart, the single write path for this table.
+model CartItem {
+  id         String          @id @default(cuid())
+  userId     String
+  user       User            @relation(fields: [userId], references: [id])
+  productId  String
+  product    Product         @relation(fields: [productId], references: [id])
+  variantId  String?
+  variant    ProductVariant? @relation(fields: [variantId], references: [id])
+  sellerId   String
+  seller     SellerProfile   @relation(fields: [sellerId], references: [id])
+  quantity   Int
+  priceAtAdd Decimal // audience-aware selling price recorded at add-time, display-only
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  @@index([userId])
+  @@index([sellerId])
+}
+
+// Phase: Product Card / Wishlist feature addition. `product` was
+// previously a bare scalar with no FK relation — added now that a real
+// wishlist UI consumes this table (packages/catalog/src/wishlist.ts).
+// Safe/additive: confirmed zero existing rows before this migration (no
+// wishlist UI existed to have ever written one).
+model WishlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// 5. Checkout & Orders (Phase 4)
+//
+// The Phase 0 placeholder `Order`/`OrderItem`/`OrderStatusHistory` models
+// (one flat `Order` row per seller, linked only by a shared `orderGroupId`
+// string) had zero rows and zero application code referencing them — this
+// is a redesign, not a data migration. It splits the single `Order` model
+// into an explicit `CheckoutGroup` (one checkout) that owns N `SellerOrder`
+// rows (one per seller, per Phase 4 spec §D/§E), and adds the payment,
+// charge, shipment, pickup-point, idempotency, and audit models the Phase 4
+// business rules require. `CouponRedemption`/`RefundRequest` (untouched,
+// still out of scope this phase) are repointed at `SellerOrder` below.
+// ---------------------------------------------------------------------------
+
+enum CouponBearer {
+  ADMIN
+  SELLER
+}
+
+// Full future lifecycle per Phase 4 spec §L (defined now to avoid a second
+// enum migration later), but only the subset through DELIVERED/
+// DELIVERY_FAILED/CANCELLED is actually wired to a transition in Phase 4 —
+// see packages/orders' status-transition service. RETURN_*/REPLACEMENT_*/
+// REFUND_*/RTO_*/CLOSED are reserved, unreachable states in this phase.
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAYMENT_PARTIALLY_RECEIVED
+  CONFIRMED
+  SELLER_ACCEPTED
+  PACKED
+  PICKUP_SCHEDULED
+  PICKED_UP
+  IN_TRANSIT
+  DELIVERED
+  DELIVERY_FAILED
+  CANCELLATION_REQUESTED
+  CANCELLED
+  RETURN_REQUESTED
+  RETURN_APPROVED
+  RETURN_REJECTED
+  REPLACEMENT_APPROVED
+  REPLACEMENT_DISPATCHED
+  REFUND_INITIATED
+  REFUND_COMPLETED
+  RTO_INITIATED
+  RTO_DELIVERED_TO_SELLER
+  CLOSED
+}
+
+enum PaymentStatus {
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  FAILED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+}
+
+enum PaymentMethod {
+  COD
+  ONLINE_FULL
+  ONLINE_PARTIAL
+  WALLET
+  TRANSPORT_FULL_ONLINE
+}
+
+// Dealer-only choice today (§H1) — customer orders always use KISAN4U_COURIER.
+enum DeliveryMethod {
+  KISAN4U_COURIER
+  TRANSPORT
+}
+
+// Who a calculated charge is ultimately borne by/collected by — kept
+// distinct from PaymentMethod (how the customer pays) and OrderStatus (what
+// stage the order is at). See OrderCharge below and Phase 4 spec §J3.
+enum ChargePayer {
+  CUSTOMER
+  SELLER
+  KISAN4U
+}
+
+enum ChargeCalcType {
+  FLAT
+  PERCENTAGE
+}
+
+// Who/what triggered a status or payment change — recorded on every history
+// row per Phase 4 spec §L1 ("source such as customer, seller, admin,
+// payment provider or logistics provider").
+enum OrderEventSource {
+  CUSTOMER
+  SELLER
+  ADMIN
+  PAYMENT_PROVIDER
+  LOGISTICS_PROVIDER
+  SYSTEM
+}
+
+enum ShipmentStatus {
+  CREATED
+  PICKUP_SCHEDULED
+  PICKED_UP
+  IN_TRANSIT
+  DELIVERED
+  DELIVERY_FAILED
+  RTO_INITIATED
+  RTO_DELIVERED_TO_SELLER
+}
+
+enum PartialPaymentRuleType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  MIN_ADVANCE_PERCENTAGE
+}
+
+enum IdempotencyStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+// The parent of one checkout. `customerType` snapshots the buyer's role at
+// checkout time (CUSTOMER or DEALER — never re-derived from a
+// possibly-since-changed User.role). Per Phase 4 spec §E, `groupNumber` is
+// the only customer-facing identifier — never expose `id`.
+model CheckoutGroup {
+  id            String   @id @default(cuid())
+  groupNumber   String   @unique // K4U-YYYYMMDD-XXXX
+  customerId    String
+  customer      User     @relation(fields: [customerId], references: [id])
+  customerType  UserRole // CUSTOMER | DEALER at time of checkout
+  createdAt     DateTime @default(now())
+  // Legacy site's orders.order_group_id (or a synthesized per-order key when
+  // that column held the "no real grouping" sentinel) — set only for
+  // historical orders backfilled from the old site, null for every real
+  // checkout on this platform. Lets the order-migration script rerun
+  // idempotently (upsert by this key) the same way Product.legacyId does.
+  legacyGroupId String?  @unique
+
+  // POS-only — set when a staff member checks out on a buyer's behalf
+  // (apps/dashboard/src/app/admin/pos/actions.ts). Null for every
+  // self-service checkout. placedByName is an immutable snapshot at
+  // checkout time — same "don't let a later edit corrupt history"
+  // convention as OrderAddressSnapshot/Shipment.pickupPointSnapshot — a
+  // later name change or account deactivation must never alter what an
+  // already-placed order displays.
+  placedByUserId String?
+  placedByUser   User?   @relation("CheckoutGroupPlacedBy", fields: [placedByUserId], references: [id])
+  placedByName   String?
+
+  addressSnapshot OrderAddressSnapshot?
+  sellerOrders    SellerOrder[]
+  payments        Payment[]
+  idempotencyKey  OrderIdempotencyKey?
+  settlements     SellerSettlement[]
+
+  paymentProofSubmissions PosPaymentProofSubmission[]
+}
+
+enum PosPaymentProofStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// POS-only. A POS checkout() call produces one Payment covering
+// potentially several SellerOrders (multi-seller cart) — the buyer made
+// ONE external payment (UPI/bank transfer, outside the app) for the whole
+// cart, so the proof and its approval act on the whole CheckoutGroup at
+// once, not one seller order. Never created for COD (nothing to prove) or
+// a self-service checkout (CheckoutGroup.placedByUserId is null there).
+//
+// A buyer paying in instalments (e.g. 1000 collected as 200+300+500) is
+// modeled as multiple INDEPENDENT rows for the same checkoutGroupId, each
+// its own previousSubmissionId revision chain ("slot") — not one shared
+// chain. A submission is "live" (still relevant) iff no other submission's
+// previousSubmissionId points at it, i.e. it has no nextSubmission; see
+// selectLivePaymentProofSubmissions/isPaymentProofFullyApproved in
+// packages/orders/src/pos-payment-proof.ts, the single source of truth
+// for this derivation — every reader must use it rather than re-deriving.
+// A slot's status can only be re-decided once (PENDING -> APPROVED or
+// REJECTED); a REJECTED slot is fixed by uploading a NEW row chained via
+// previousSubmissionId to that specific rejected row — every OTHER live
+// slot is untouched. The whole checkout group's payment is only ever
+// considered proved once every live slot is APPROVED.
+model PosPaymentProofSubmission {
+  id              String        @id @default(cuid())
+  checkoutGroupId String
+  checkoutGroup   CheckoutGroup @relation(fields: [checkoutGroupId], references: [id])
+
+  // The rupee amount this one screenshot claims to cover — agent-entered
+  // at upload time (not auto-derived from the payment's outstanding
+  // balance). Used both for display (per-slot + running total) and, once
+  // every live slot for the group is APPROVED, sanity-checked against
+  // Payment.totalAmount — see decidePosPaymentProof. Approval still sets
+  // Payment.amountPaid from Payment.totalAmount directly (the invariant
+  // "every slot approved => the declared total was actually collected"),
+  // not summed from these amounts.
+  amount Decimal
+
+  screenshotStorageKey String
+  screenshotMimeType   String
+  screenshotSizeBytes  Int
+
+  status          PosPaymentProofStatus @default(PENDING)
+  rejectionReason String?
+
+  uploadedById String
+  uploadedBy   User      @relation("PosPaymentProofUploadedBy", fields: [uploadedById], references: [id])
+  uploadedAt   DateTime  @default(now())
+  reviewedById String?
+  reviewedBy   User?     @relation("PosPaymentProofReviewedBy", fields: [reviewedById], references: [id])
+  reviewedAt   DateTime?
+
+  // A resubmission after REJECT creates a NEW row — same revision-chain
+  // convention as SellerLicenceSubmission.previousRevisionId, never
+  // overwrite a rejected submission's reason/reviewer.
+  previousSubmissionId String?                    @unique
+  previousSubmission   PosPaymentProofSubmission? @relation("PosPaymentProofRevisionChain", fields: [previousSubmissionId], references: [id])
+  nextSubmission       PosPaymentProofSubmission? @relation("PosPaymentProofRevisionChain")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([checkoutGroupId])
+  @@index([status])
+}
+
+// Immutable copy of the delivery address used for this checkout — per
+// Phase 4 spec §C2/§F, editing or deleting the source CustomerAddress row
+// later must never change what a past order shows. `sourceAddressId` is
+// informational only (no FK/cascade), matching the existing
+// CartItem/OrderItem convention of non-strict references to data that may
+// legitimately be edited or removed later.
+model OrderAddressSnapshot {
+  id              String        @id @default(cuid())
+  checkoutGroupId String        @unique
+  checkoutGroup   CheckoutGroup @relation(fields: [checkoutGroupId], references: [id])
+  sourceAddressId String?
+  fullName        String
+  mobile          String
+  altMobile       String?
+  line1           String
+  line2           String?
+  landmark        String?
+  cityTown        String
+  district        String
+  state           String
+  stateId         String?
+  pincode         String
+  addressType     AddressKind
+  createdAt       DateTime      @default(now())
+}
+
+// One per seller per checkout (Phase 4 spec §D/§E). `sellerId` is always
+// required — Phase 4 does not support checking out an in-house/admin
+// product (Product.sellerId null); see packages/orders cart validation,
+// which rejects adding such a product to cart with an explicit error rather
+// than silently misrouting it to no seller workflow.
+model SellerOrder {
+  id              String        @id @default(cuid())
+  orderNumber     String        @unique // K4U-YYYYMMDD-XXXX-S1, -S2, ...
+  checkoutGroupId String
+  checkoutGroup   CheckoutGroup @relation(fields: [checkoutGroupId], references: [id])
+  customerId      String // denormalized from checkoutGroup for direct seller-scoped queries
+  customer        User          @relation(fields: [customerId], references: [id])
+  sellerId        String
+  seller          SellerProfile @relation(fields: [sellerId], references: [id])
+  customerType    UserRole // snapshot, same value as CheckoutGroup.customerType
+  buyerGstNumberSnapshot String?
+
+  status         OrderStatus    @default(PENDING_PAYMENT)
+  paymentMethod  PaymentMethod
+  deliveryMethod DeliveryMethod
+  // Dealer Transport only (§H1) — an optional preference, never a price.
+  transportNote  String?
+
+  pickupPointId String?
+  pickupPoint   SellerPickupPoint? @relation(fields: [pickupPointId], references: [id])
+
+  // Set by requestCancellation when the customer picks how to be refunded
+  // (only asked when real, non-wallet money was already captured for this
+  // order — nothing to ask for an unpaid COD cancellation). Read back by
+  // decideCancellation on approval to build the resulting order-level
+  // RefundRequest (packages/orders/src/cancellation.ts). WALLET or
+  // ORIGINAL_SOURCE only — BANK_TRANSFER never applies pre-delivery (that's
+  // specifically the no-electronic-source COD case, and COD collects
+  // nothing before delivery, so there's never COD cash to refund here).
+  cancellationRefundMethod RefundMethod?
+
+  subtotal       Decimal
+  discountAmount Decimal @default(0)
+  taxAmount      Decimal @default(0)
+  totalAmount    Decimal // subtotal - discountAmount + taxAmount + customerPayableDelivery (see OrderCharge)
+
+  invoiceNumber String? @unique
+
+  // Denormalized from CheckoutGroup.placedByUserId/placedByName, same
+  // reasoning as customerId/customerType above — direct seller/admin-scoped
+  // queries without an extra join. Plain scalars, no relation, same
+  // informational-reference convention as OrderStatusHistory.actorId — this
+  // is a copy, not the source of truth.
+  placedByUserId String?
+  placedByName   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items              OrderItem[]
+  statusHistory      OrderStatusHistory[]
+  notes              OrderNote[]
+  charge             OrderCharge?
+  shipment           Shipment?
+  paymentAllocations PaymentAllocation[]
+  couponRedemptions  CouponRedemption[]
+  refundRequests     RefundRequest[]
+  settlements        SellerSettlement[]
+
+  // Legacy site's orders.id — one legacy order can split into more than one
+  // SellerOrder (order_details.seller_id, never the unreliable order-header
+  // seller_id, is grouped per distinct real seller — confirmed ~3.6% of
+  // legacy orders genuinely mix line items from two different sellers).
+  // Both null for every real order placed on this platform; both set
+  // together only for historical backfilled orders, letting the
+  // order-migration script rerun idempotently via the composite unique
+  // below, the same way ProductVariant's legacyProductId/legacyVariantType
+  // pair works.
+  legacyOrderId  String?
+  legacySellerId String?
+
+  // True only for migrated orders whose legacy status was already a
+  // closed-out terminal state (DELIVERED/CANCELLED/RETURN_APPROVED/
+  // DELIVERY_FAILED) at import time — these get the human-visible
+  // "LEGACY-" orderNumber prefix and are permanently excluded from
+  // settlement (packages/orders/src/settlement-reconciliation.ts), since
+  // there's no real charge/logistics backing them. A migrated order that
+  // was still in-progress (PENDING_PAYMENT/CONFIRMED/SELLER_ACCEPTED/
+  // IN_TRANSIT) gets a normal-looking orderNumber and this stays false —
+  // it's treated as a live order and settles normally if it later
+  // genuinely reaches DELIVERED through the real app. Always false for
+  // every order placed natively on this platform.
+  legacyClosedOut Boolean @default(false)
+
+  @@unique([legacyOrderId, legacySellerId])
+  @@index([sellerId])
+  @@index([customerId])
+  @@index([status])
+  @@index([placedByUserId])
+}
+
+// Immutable line-item snapshot per Phase 4 spec §F. `productId`/`variantId`
+// are informational references (not strict FKs), matching the prior
+// OrderItem convention — a line item must remain fully renderable even if
+// the underlying product/variant is later edited or removed.
+model OrderItem {
+  id            String      @id @default(cuid())
+  sellerOrderId String
+  sellerOrder   SellerOrder @relation(fields: [sellerOrderId], references: [id])
+
+  productId       String
+  productName     String
+  productImageUrl String
+  variantId       String?
+  variantLabel    String?
+  sku             String
+
+  quantity         Int
+  unit             BaseUnit
+  unitWeightGrams  Int
+  totalWeightGrams Int
+
+  mrp                     Decimal
+  unitPrice               Decimal // customer/dealer price at checkout
+  discountAmount          Decimal     @default(0)
+  taxRatePercent          Decimal     @default(0)
+  // Snapshotted from the product/variant's own taxCalcMode at checkout
+  // time (see the Prisma TaxCalcMode enum's doc comment) — never looked
+  // up live, same reasoning as every other snapshot field here (a later
+  // change to the live product must never retroactively change what an
+  // already-placed order's tax breakdown was). Defaults every
+  // pre-existing row (before this column existed) to EXCLUDE_WITH_PRICE:
+  // that's not a guess, it's what actually happened at checkout for
+  // every one of those orders — `taxAmount` was always computed as
+  // unitPrice*quantity*taxRatePercent/100 and added ON TOP of `subtotal`,
+  // which is exactly EXCLUDE_WITH_PRICE's behavior. Going forward every
+  // new row gets its real value.
+  taxCalcMode             TaxCalcMode @default(EXCLUDE_WITH_PRICE)
+  taxAmount               Decimal     @default(0)
+  // The line's TAXABLE value (quantity * unitPrice - discountAmount,
+  // further reduced below unitPrice*quantity when taxCalcMode is
+  // INCLUDE_WITH_PRICE — see resolveTaxBreakdown in
+  // packages/orders/src/money.ts) — NOT unitPrice*quantity verbatim.
+  // `subtotal + taxAmount` always reconstructs unitPrice*quantity exactly
+  // (minus discountAmount), regardless of taxCalcMode — every downstream
+  // reader (settlement, RapidShyp) relies on that invariant, not on
+  // `subtotal` alone meaning "the customer-facing price."
+  subtotal                Decimal
+  licenseRequiredSnapshot Boolean     @default(false)
+  // Dealer loyalty points earned per unit of this line, snapshotted from
+  // ProductVariant.loyaltyPoints / ProductDealerConfig.loyaltyPoints at
+  // order-placement time (same reasoning as mrp/unitPrice above — a later
+  // change to the live product must never retroactively change what an
+  // already-placed order pays out). Always 0 for a CUSTOMER-audience line;
+  // the earning scheme is dealer-only. See packages/orders/src/loyalty-points.ts.
+  loyaltyPoints           Int         @default(0)
+
+  refundStatus RefundStatus @default(NONE)
+  createdAt    DateTime     @default(now())
+
+  refundRequests RefundRequest[]
+  productReviews ProductReview[]
+  settlement     SellerSettlement?
+
+  // Legacy site's order_details.id — already globally unique on its own
+  // (no composite needed, unlike the variant-linking keys elsewhere), so a
+  // rerun can upsert a single line item directly rather than needing to
+  // delete-and-recreate every item under a SellerOrder (which would risk
+  // orphaning a real ProductReview/RefundRequest a customer created against
+  // this line after import). Null for every real order placed on this
+  // platform.
+  legacyOrderDetailId String? @unique
+}
+
+// Append-only — never updated or deleted, only inserted (Phase 4 spec §L1).
+model OrderStatusHistory {
+  id            String           @id @default(cuid())
+  sellerOrderId String
+  sellerOrder   SellerOrder      @relation(fields: [sellerOrderId], references: [id])
+  status        OrderStatus
+  actorId       String // may reference a User, AdminProfile, or SellerProfile id depending on actorRole
+  actorRole     UserRole
+  source        OrderEventSource
+  note          String?
+  createdAt     DateTime         @default(now())
+
+  @@index([sellerOrderId])
+}
+
+// Free-text internal remarks an admin / scheduling-team member can attach
+// to an order at ANY stage — independent of OrderStatusHistory.note (which
+// only exists tied to a status transition). Append-only working log,
+// never shown to the seller or the customer. authorId/authorName/authorRole
+// are informational snapshots (same convention as
+// OrderStatusHistory.actorId), not relations.
+model OrderNote {
+  id            String      @id @default(cuid())
+  sellerOrderId String
+  sellerOrder   SellerOrder @relation(fields: [sellerOrderId], references: [id], onDelete: Cascade)
+  body          String
+  authorId      String
+  authorName    String
+  authorRole    UserRole
+  createdAt     DateTime    @default(now())
+
+  @@index([sellerOrderId, createdAt])
+}
+
+// One per SellerOrder — the seller-wise logistics/collection charge
+// calculation per Phase 4 spec §J. `slabSnapshot` records exactly which
+// LogisticsWeightSlab (or the above-max price) was matched for
+// KISAN4U_COURIER, or which ShippingMethod was used for TRANSPORT, so later
+// config edits can never change what an existing order shows it was
+// charged.
+//
+// Corrective-migration addition (business-rule fix pass): the promotional
+// discount fields are deliberately separate scalar columns, never merged
+// into `collectionCharge`/`transportationCost` or a single generic
+// "discount" figure — the requirement is that the system can explain what
+// the customer paid, what the seller bore, and what Kisan4u bore as three
+// independently query-able numbers, not a total that has to be reverse
+// engineered. `collectionChargeSnapshot` records the exact formula inputs
+// (seller-order value used, percentage, minimum flat charge, percentage
+// result, final charge) at charge-creation time, so a later admin edit to
+// CollectionChargeConfig can never change what a past order shows it was
+// actually charged — same reasoning as `slabSnapshot`.
+model OrderCharge {
+  id                         String      @id @default(cuid())
+  sellerOrderId              String      @unique
+  sellerOrder                SellerOrder @relation(fields: [sellerOrderId], references: [id])
+  shipmentWeightGrams        Int
+  transportationCost         Decimal
+  transportationPayer        ChargePayer
+  collectionCharge           Decimal
+  collectionChargePayer      ChargePayer @default(SELLER)
+  customerPayableDelivery    Decimal // what the customer actually pays toward delivery (transportation only — collection charge is never customer-payable)
+  kisan4uCollectedAmount     Decimal // amount Kisan4u records/collects for accounting
+  sellerBorneAmount          Decimal // total of transportation (if seller-borne) + collection charge
+  slabSnapshot               Json // { configId, lowerWeightGrams|null, upperWeightGrams|null, aboveMax, price } (courier) or { mode: "TRANSPORT_ADMIN_CONFIG", shippingMethodId, cost, sellerId, title } (transport)
+  collectionChargeSnapshot   Json        @default("{}") // { sellerOrderValue, percentageUsed, minimumCharge, percentageResult, finalCharge, formula }
+  // Customer-only (§ promotional discount) — always 0/KISAN4U for dealer
+  // orders. Borne entirely by Kisan4u: never reduces seller revenue, so it
+  // is intentionally not netted into `subtotal`/`discountAmount` on
+  // SellerOrder (which stay product-discount-only, the seller's own
+  // settlement basis).
+  promotionalDiscountPercent Decimal     @default(0)
+  promotionalDiscountAmount  Decimal     @default(0)
+  promotionalDiscountPayer   ChargePayer @default(KISAN4U)
+  // What the customer is actually billed for this seller order, net of the
+  // Kisan4u-borne promotional discount — distinct from SellerOrder.totalAmount,
+  // which stays the pre-discount gross figure used as the seller's own
+  // settlement basis (Phase 5 scope).
+  customerPayableTotal       Decimal     @default(0)
+  // Total of everything Kisan4u bears for this seller order (currently just
+  // the promotional discount — kept as its own named figure rather than
+  // re-derived, per the requirement that admin must see this as a distinct
+  // number).
+  kisan4uBorneAmount         Decimal     @default(0)
+  createdAt                  DateTime    @default(now())
+}
+
+// Seller-owned dispatch locations (Phase 4 spec §K).
+model SellerPickupPoint {
+  id                     String            @id @default(cuid())
+  sellerId               String
+  seller                 SellerProfile     @relation(fields: [sellerId], references: [id])
+  name                   String
+  contactPerson          String
+  mobile                 String
+  line1                  String
+  city                   String
+  district               String
+  state                  String
+  pincode                String
+  landmark               String?
+  isDefault              Boolean           @default(false)
+  isActive               Boolean           @default(true)
+  approvalStatus         ApplicationStatus @default(PENDING)
+  rejectionReason        String?
+  // Delhivery client-warehouse name (K4U-<id>), set once an admin approves
+  // this point AND registration with Delhivery succeeds; used as
+  // pickup_location.name for a Delhivery dispatch.
+  delhiveryWarehouseName String?
+  // RapidShyp pickup-location name (address_name) this point dispatches
+  // from. Registered by courier-pickup-sync.ts on approval, like the
+  // Delhivery warehouse above.
+  rapidshypPickupName    String?
+  // Bumped whenever the address/contact of a point that was already
+  // registered with a courier changes. Neither courier's API can edit an
+  // existing pickup location, so each revision is registered as a NEW one
+  // (K4U-<id>-r<n>); the *SyncedRevision fields record which revision the
+  // stored names were registered at — a mismatch means "re-register".
+  courierAddressRevision  Int               @default(0)
+  rapidshypSyncedRevision Int?
+  delhiverySyncedRevision Int?
+  // Last courier-registration failure, shown on the admin pickup points page.
+  courierSyncError        String?
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+
+  sellerOrders SellerOrder[]
+
+  @@index([sellerId])
+}
+
+// One per SellerOrder — created once the seller marks the order packed and
+// schedules a mock pickup (Phase 4 spec §Q). `pickupPointSnapshot` copies
+// the SellerPickupPoint fields at dispatch time so a later pickup-point
+// edit never changes a past shipment's recorded origin.
+model Shipment {
+  id                     String         @id @default(cuid())
+  sellerOrderId          String         @unique
+  sellerOrder            SellerOrder    @relation(fields: [sellerOrderId], references: [id])
+  pickupPointSnapshot    Json
+  provider               String         @default("MOCK")
+  awbNumber              String?
+  status                 ShipmentStatus @default(CREATED)
+  packageCount           Int?
+  // RapidShyp integration (provider = "RAPIDSHYP") — RapidShyp's own
+  // order_id, distinct from awbNumber above (assigned only once a courier
+  // picks the shipment up; rapidshypOrderId exists from creation).
+  // trackingStatusCode/Desc + courierName + lastSyncedAt are refreshed by
+  // POST /track_order and are display-only — they do NOT themselves drive
+  // an OrderStatus/ShipmentStatus transition (see
+  // packages/orders/src/rapidshyp-shipping.ts for which codes do).
+  rapidshypOrderId       String?
+  // Distinct from rapidshypOrderId above — assigned by approve_orders,
+  // RapidShyp's internal shipment identifier once the order has actually
+  // been approved into a real shipment (create_order alone leaves it
+  // unapproved and invisible in their dashboard; see rapidshyp-shipping.ts).
+  rapidshypShipmentId    String?
+  courierName            String?
+  // Which Delhivery account (of the 3) a DELHIVERY shipment was created on —
+  // every later call for it (label / track / cancel) must use the same one.
+  delhiveryAccount       String?
+  // RapidShyp-hosted shipping-label PDF (public S3 URL). Populated at
+  // dispatch (rapidshyp-shipping.ts assigns the AWB, then calls
+  // generate_label), or backfilled by refreshRapidShypTrackingStatus once
+  // an AWB exists. Only ever set for provider === "RAPIDSHYP".
+  labelUrl               String?
+  labelFetchedAt         DateTime?
+  trackingStatusCode     String?
+  trackingStatusDesc     String?
+  lastSyncedAt           DateTime?
+  // Reverse pickup for a post-delivery return (packages/orders/src/
+  // rapidshyp-return.ts) — a SEPARATE logistics leg from the forward
+  // shipment above, only ever set when provider === "RAPIDSHYP" (a mock/
+  // manual-logistics return is handled entirely by hand, unchanged — see
+  // that file's own doc comment). RapidShyp's create_return is a single
+  // call with no separate approve step (unlike forward create_order),
+  // so returnShipmentId comes back populated immediately.
+  returnRapidshypOrderId String?
+  returnShipmentId       String?
+  returnRequestedAt      DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  statusHistory ShipmentStatusHistory[]
+}
+
+model ShipmentStatusHistory {
+  id                  String          @id @default(cuid())
+  shipmentId          String
+  shipment            Shipment        @relation(fields: [shipmentId], references: [id])
+  // Null for an informational-only row — a courier status code that isn't
+  // one of the forward-progress codes wired to a real OrderStatus/
+  // ShipmentStatus transition (see providers/rapidshyp.ts's
+  // RAPIDSHYP_FORWARD_STATUS_MAP doc comment: RTO_*, DMG, LST, ONH, MSR,
+  // DPO, CAN, and anything unrecognized). Every other row (every manual
+  // mock event, and every RapidShyp forward-progress code) still sets this
+  // to the real transition it drove, exactly as before this column pair
+  // was added.
+  status              ShipmentStatus?
+  // The two below are RapidShyp-only (null for every mock-provider row) —
+  // together they're what lets the UI render a full tracking flow chart of
+  // literally everything RapidShyp reported, not just the subset that
+  // happened to also move our own OrderStatus.
+  courierStatusCode   String?
+  courierStatusDesc   String?
+  rawProviderResponse Json?
+  createdAt           DateTime        @default(now())
+}
+
+// One Payment can cover multiple SellerOrders from the same checkout;
+// PaymentAllocation records how much of it applies to each (Phase 4 spec
+// §I3/§I5 — "store payment allocation seller-wise").
+model Payment {
+  id                  String        @id @default(cuid())
+  checkoutGroupId     String
+  checkoutGroup       CheckoutGroup @relation(fields: [checkoutGroupId], references: [id])
+  customerId          String
+  customer            User          @relation(fields: [customerId], references: [id])
+  method              PaymentMethod
+  status              PaymentStatus @default(PENDING)
+  totalAmount         Decimal // amount this payment attempt covers
+  amountPaid          Decimal       @default(0)
+  // Portion of amountPaid funded by a Kisan4U Wallet debit rather than the
+  // online provider/COD — wallet is an additive funding source layered on
+  // top of whichever PaymentMethod was chosen, never a payment method of
+  // its own (see packages/orders/src/wallet.ts). 0 when no wallet amount
+  // was applied.
+  walletAmountApplied Decimal       @default(0)
+  providerReference   String? // mock provider's transaction id, or the Razorpay order/payment id once real gateway checkout is in play
+  internalReference   String        @unique // our own reference, safe to show/print
+  remainingDueNote    String? // e.g. "Balance due on delivery (COD)"
+  // Set the moment a real Razorpay Order is created for this payment
+  // attempt (packages/orders/src/checkout.ts's applyInitialPayment) — the
+  // client opens the Razorpay Checkout widget against this id. Null for
+  // COD, a fully wallet-covered payment, a POS payment-proof-gated one, or
+  // any payment made before this integration existed.
+  razorpayOrderId     String?
+  // Set only once verified — either by completeRazorpayPayment (the
+  // client's post-widget callback, HMAC-checked) or the payment.captured
+  // webhook, whichever arrives first. This is the id Razorpay Refunds
+  // (packages/orders/src/refunds.ts's completeRefund) refunds against.
+  razorpayPaymentId   String?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  allocations   PaymentAllocation[]
+  statusHistory PaymentStatusHistory[]
+
+  @@index([customerId])
+}
+
+model PaymentAllocation {
+  id                       String      @id @default(cuid())
+  paymentId                String
+  payment                  Payment     @relation(fields: [paymentId], references: [id])
+  sellerOrderId            String
+  sellerOrder              SellerOrder @relation(fields: [sellerOrderId], references: [id])
+  amount                   Decimal
+  // This seller order's proportional share of Payment.walletAmountApplied
+  // (allocateProportionally, same largest-remainder method as the customer
+  // promo discount split) — read back by cancellation.ts to credit the
+  // right amount to the wallet if this specific seller order is cancelled,
+  // without double-refunding a sibling seller order's own share.
+  walletAmountApplied      Decimal     @default(0)
+  // Set once this allocation's wallet share has been credited back
+  // (order cancellation) — guards against a duplicate credit if
+  // decideCancellation is ever invoked twice for the same order.
+  walletRefunded           Boolean     @default(false)
+  // Cash (COD) or a deferred ONLINE_PARTIAL balance collected AFTER the
+  // original payment attempt — at delivery (automatically) or earlier via
+  // an admin's manual "record payment collected" action (see
+  // packages/orders/src/payment-collection.ts). Deliberately separate
+  // from Payment.amountPaid/totalAmount (which stay exactly as the
+  // original checkout attempt left them, forever) rather than folding
+  // into those shared fields: a single Payment can be split across
+  // several seller orders in a multi-seller checkout via sibling
+  // PaymentAllocation rows, and mutating the shared totalAmount/amountPaid
+  // to represent one seller order's own later collection would corrupt
+  // the amountPaid/totalAmount ratio every OTHER sibling allocation on
+  // that same Payment relies on to prorate its own share correctly.
+  // Tracking it here instead, per allocation, is what keeps one seller's
+  // COD collection from ever affecting another seller's own figures.
+  remainingCollectedAmount Decimal     @default(0)
+  createdAt                DateTime    @default(now())
+
+  @@unique([paymentId, sellerOrderId])
+}
+
+// Append-only (Phase 4 spec §I5).
+model PaymentStatusHistory {
+  id        String           @id @default(cuid())
+  paymentId String
+  payment   Payment          @relation(fields: [paymentId], references: [id])
+  status    PaymentStatus
+  note      String?
+  source    OrderEventSource
+  createdAt DateTime         @default(now())
+}
+
+// Admin-configured partial-payment rule (Phase 4 spec §I3). `appliesTo`
+// null = applies to both CUSTOMER and DEALER; set = audience-specific
+// override. `isDemo` marks the seeded starter value as a clearly-labeled
+// placeholder business rule, not an approved percentage — see seed.ts.
+model PartialPaymentConfig {
+  id        String                 @id @default(cuid())
+  label     String
+  appliesTo UserRole?
+  ruleType  PartialPaymentRuleType
+  value     Decimal
+  isActive  Boolean                @default(true)
+  isDemo    Boolean                @default(true)
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+}
+
+// A claim-ticket inserted (unique on `key`) before the checkout transaction
+// runs, so a refreshed/double-clicked Place Order request finds the
+// existing row (unique-constraint violation) and replays its result instead
+// of creating a second CheckoutGroup (Phase 4 spec §D/§Z). See
+// packages/orders' checkout entry point — this is the actual duplicate-
+// submission guard, not just documentation of intent.
+model OrderIdempotencyKey {
+  id              String            @id @default(cuid())
+  key             String            @unique
+  userId          String
+  status          IdempotencyStatus @default(PENDING)
+  checkoutGroupId String?           @unique
+  checkoutGroup   CheckoutGroup?    @relation(fields: [checkoutGroupId], references: [id])
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([userId])
+}
+
+// Phase 4 spec §U — sensitive-operation audit trail. `actorId`/`actorRole`
+// follow the same "not a single-table FK" convention as
+// OrderStatusHistory.actorId (may be a User, AdminProfile, or SellerProfile
+// id depending on actorRole).
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  actorRole  UserRole
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+}
+
+// ---------------------------------------------------------------------------
+// 6. Coupons
+// ---------------------------------------------------------------------------
+
+model Coupon {
+  id            String         @id @default(cuid())
+  code          String         @unique
+  bearer        CouponBearer
+  sellerId      String?
+  seller        SellerProfile? @relation(fields: [sellerId], references: [id])
+  // Who can redeem the coupon (CUSTOMER_ONLY/DEALER_ONLY/BOTH) — distinct
+  // from `bearer`, which is who issued it (platform vs. a specific
+  // seller). Reuses ProductAudience rather than a new enum since it's the
+  // exact same three-way split already used for products.
+  audience      ProductAudience
+  discountType  DiscountType
+  discountValue Decimal
+  minPurchase   Decimal        @default(0)
+  maxDiscount   Decimal?
+  usageLimit    Int?
+  perUserLimit  Int?
+  startDate     DateTime
+  endDate       DateTime
+  // Manual pause, independent of startDate/endDate — lets an admin
+  // disable a coupon without losing/editing its configured validity
+  // window.
+  isActive      Boolean        @default(true)
+  // Total successful redemptions across all seller orders in a checkout,
+  // incremented once per checkout (not once per seller order) inside the
+  // same transaction that creates the SellerOrder(s) — see
+  // packages/orders/src/checkout.ts. Checked against usageLimit.
+  usageCount    Int            @default(0)
+  createdAt     DateTime       @default(now())
+
+  redemptions CouponRedemption[]
+}
+
+model CouponRedemption {
+  id             String      @id @default(cuid())
+  couponId       String
+  coupon         Coupon      @relation(fields: [couponId], references: [id])
+  userId         String
+  user           User        @relation(fields: [userId], references: [id])
+  sellerOrderId  String
+  sellerOrder    SellerOrder @relation(fields: [sellerOrderId], references: [id])
+  discountAmount Decimal
+  createdAt      DateTime    @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 7. Refunds
+// ---------------------------------------------------------------------------
+
+enum RefundStatus {
+  NONE
+  PENDING
+  APPROVED
+  REJECTED
+  REFUNDED
+}
+
+// WALLET is always offered (no external dependency). ORIGINAL_SOURCE is
+// only valid for an order that actually had an electronic payment
+// component (not plain COD) — refunded via the payment gateway back to
+// whatever card/UPI/netbanking source was originally charged. BANK_TRANSFER
+// is the COD counterpart — nothing was ever collected electronically, so
+// the customer supplies their own bank account instead. See
+// packages/orders/src/refunds.ts for which is allowed per PaymentMethod.
+enum RefundMethod {
+  WALLET
+  ORIGINAL_SOURCE
+  BANK_TRANSFER
+}
+
+model RefundRequest {
+  id            String       @id @default(cuid())
+  sellerOrderId String
+  sellerOrder   SellerOrder  @relation(fields: [sellerOrderId], references: [id])
+  // Null means this refund covers the WHOLE seller order — the
+  // pre-delivery cancellation refund path (packages/orders/src/
+  // cancellation.ts's decideCancellation), where the entire order is
+  // cancelled at once, not one line item. Set for the post-delivery
+  // per-item return flow (requestReturn), which is still whole-item-only,
+  // never partial-quantity.
+  orderItemId   String?
+  orderItem     OrderItem?   @relation(fields: [orderItemId], references: [id])
+  customerId    String
+  customer      User         @relation(fields: [customerId], references: [id])
+  status        RefundStatus @default(PENDING)
+  reason        String
+  // At least one required — enforced by requestReturnInputSchema, not
+  // here (a bare String[] has no non-empty constraint at the DB level).
+  imageUrls     String[]
+  // Optional — one short video of the issue, in addition to the mandatory
+  // photos. Single field (not an array): one clip is enough evidence, and
+  // keeps the upload UI to one video slot.
+  videoUrl      String?
+  amount        Decimal
+  reviewNote    String?
+  reviewedById  String? // may reference an Admin or Seller id depending on who acted
+  createdAt     DateTime     @default(now())
+
+  // Chosen by the customer at request time (BANK_TRANSFER forced for a COD
+  // order, ORIGINAL_SOURCE offered only for a prepaid one, WALLET always
+  // available) — see requestReturn's own validation, the actual authority.
+  refundMethod          RefundMethod
+  bankAccountHolderName String?
+  bankAccountNumber     String?
+  bankIfsc              String?
+  // The real proof of money having moved — a gateway refund id (Razorpay
+  // Refunds API), a RazorpayX payout id, or (until those are wired in) a
+  // manually-entered reference for a refund/transfer completed by hand
+  // outside the system. Required before REFUND_COMPLETED for
+  // ORIGINAL_SOURCE/BANK_TRANSFER; never set for WALLET, whose "proof" is
+  // simply the WalletTransaction row itself.
+  externalReference     String?
+  completedAt           DateTime?
+
+  history RefundStatusHistory[]
+}
+
+model RefundStatusHistory {
+  id              String        @id @default(cuid())
+  refundRequestId String
+  refundRequest   RefundRequest @relation(fields: [refundRequestId], references: [id])
+  status          RefundStatus
+  changedById     String // may reference an Admin or Seller id
+  changedByRole   UserRole
+  message         String?
+  createdAt       DateTime      @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 8. Wallets (unifies 4 legacy wallet pairs into one polymorphic pattern)
+// ---------------------------------------------------------------------------
+
+enum WalletOwnerType {
+  CUSTOMER
+  DEALER
+  SELLER
+  ADMIN
+  DELIVERY_MAN
+}
+
+enum TransactionType {
+  CREDIT
+  DEBIT
+}
+
+enum TransactionReason {
+  ORDER_COMMISSION
+  ORDER_EARNING
+  // Phase 4 addition: customer wallet debit when PaymentMethod.WALLET is
+  // used at checkout — see packages/providers' mock payment provider.
+  ORDER_PAYMENT
+  DELIVERY_CHARGE
+  COD_COLLECTION
+  REFUND_DEBIT
+  REFUND_CREDIT
+  WALLET_TOPUP
+  // Manual credit added by an admin from the customer/dealer detail page —
+  // no payment gateway involved (goodwill credit, offline payment recorded,
+  // support adjustment). See packages/orders/src/wallet.ts adminCreditWallet.
+  ADMIN_CREDIT
+  WITHDRAWAL
+  LOYALTY_BONUS
+  REFERRAL_COMMISSION
+  ACCOUNT_DELETION_FORFEITURE
+}
+
+enum WalletTopupStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+/**
+ * A self-service "add money to my Kisan4U Wallet" attempt paid through
+ * Razorpay (the same gateway as self-service checkout — see
+ * packages/orders/src/wallet.ts). One row per attempt: created PENDING
+ * alongside a Razorpay order, flipped to PAID exactly once when either the
+ * client callback (signature-verified) or the payment.captured webhook
+ * confirms capture, at which point walletTransactionId points at the
+ * single CREDIT ledger row it produced (the idempotency guard).
+ */
+model WalletTopup {
+  id                  String            @id @default(cuid())
+  // User.id of the customer or dealer — same polymorphic-by-convention
+  // ownerId the Wallet model uses, never a Prisma relation.
+  ownerId             String
+  ownerType           WalletOwnerType
+  amount              Decimal
+  status              WalletTopupStatus @default(PENDING)
+  provider            String            @default("RAZORPAY")
+  razorpayOrderId     String?           @unique
+  razorpayPaymentId   String?
+  walletTransactionId String?           @unique
+  createdAt           DateTime          @default(now())
+  completedAt         DateTime?
+
+  @@index([ownerId])
+}
+
+model Wallet {
+  id              String          @id @default(cuid())
+  // NOTE: intentionally NOT a Prisma @relation — ownerId points at whichever
+  // of User/SellerProfile/AdminProfile/DeliveryManProfile matches ownerType.
+  // Prisma relations require a single target table, so this polymorphic
+  // reference is enforced at the application layer. See DATABASE_MODEL_PLAN.md §8.
+  ownerType       WalletOwnerType
+  ownerId         String          @unique
+  balance         Decimal         @default(0)
+  cashInHand      Decimal         @default(0) // delivery-man COD cash; unused for other owner types
+  loyaltyPoints   Int             @default(0) // customer/dealer only
+  pendingWithdraw Decimal         @default(0)
+
+  transactions              WalletTransaction[]
+  loyaltyPointsTransactions LoyaltyPointsTransaction[]
+}
+
+model WalletTransaction {
+  id            String            @id @default(cuid())
+  walletId      String
+  wallet        Wallet            @relation(fields: [walletId], references: [id])
+  type          TransactionType
+  reason        TransactionReason
+  amount        Decimal
+  balanceAfter  Decimal
+  referenceType String? // "order" | "refund" | "withdraw_request"
+  referenceId   String?
+  createdAt     DateTime          @default(now())
+}
+
+enum LoyaltyPointsReason {
+  ORDER_DELIVERED
+  ORDER_REFUND_REVERSAL
+}
+
+// Ledger for Wallet.loyaltyPoints, mirroring WalletTransaction's shape for
+// the money balance — every mutation of loyaltyPoints is paired with one
+// of these, never a bare balance update, same discipline as the money
+// wallet. Dealer-only (see OrderItem.loyaltyPoints); not redeemable yet —
+// this ledger exists for audit/history, not spending.
+model LoyaltyPointsTransaction {
+  id            String              @id @default(cuid())
+  walletId      String
+  wallet        Wallet              @relation(fields: [walletId], references: [id])
+  type          TransactionType
+  reason        LoyaltyPointsReason
+  points        Int
+  balanceAfter  Int
+  referenceType String? // "seller_order" | "order_item"
+  referenceId   String?
+  createdAt     DateTime            @default(now())
+
+  @@index([walletId])
+}
+
+enum WithdrawStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+}
+
+model WithdrawRequest {
+  id            String          @id @default(cuid())
+  ownerType     WalletOwnerType // see Wallet note above — same polymorphic-by-design pattern
+  ownerId       String
+  amount        Decimal
+  status        WithdrawStatus  @default(PENDING)
+  methodDetails Json
+  reviewedById  String?
+  createdAt     DateTime        @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 9. Shipping & Logistics
+// ---------------------------------------------------------------------------
+
+model ShippingMethod {
+  id           String         @id @default(cuid())
+  sellerId     String? // null = admin-defined, platform-wide
+  seller       SellerProfile? @relation(fields: [sellerId], references: [id])
+  title        String
+  cost         Decimal
+  durationDays Int
+  isActive     Boolean        @default(true)
+}
+
+model Warehouse {
+  id       String        @id @default(cuid())
+  sellerId String
+  seller   SellerProfile @relation(fields: [sellerId], references: [id])
+  name     String
+  address  String
+  city     String
+  state    String
+  pincode  String
+}
+
+// ---------------------------------------------------------------------------
+// Category-based seller selling-licence module.
+//
+// LicenceRequirement is attached directly to a Category, Subcategory, or
+// SubSubCategory (taxonomyNodeType/taxonomyNodeId — polymorphic by
+// convention, same non-FK pattern as AuditLog.entityId/OrderStatusHistory.
+// actorId elsewhere in this schema, since a single FK column can't target
+// three different tables). Requirements are inherited downward only (see
+// packages/catalog/src/licence-eligibility.ts) — never stored as a
+// redundant boolean on the taxonomy row itself, so "does this node require
+// a licence" is always derived from whether it has active requirement rows,
+// never allowed to drift out of sync.
+//
+// A material change (audience, geo type, sameLicenceForBothAudiences, or
+// deactivation) never mutates a requirement in place — it closes out the
+// current row (isActive: false) and inserts a new row with version + 1,
+// linked via previousVersionId/nextVersion. Every existing
+// SellerLicenceSubmission keeps pointing at the exact version it was
+// approved against, so a later requirement change can never silently
+// reinterpret a past approval. Cosmetic edits (name only) update in place.
+enum TaxonomyNodeType {
+  CATEGORY
+  SUBCATEGORY
+  SUBSUBCATEGORY
+}
+
+enum LicenceGeoType {
+  PAN_INDIA
+  STATE_WISE
+}
+
+model LicenceRequirement {
+  id               String           @id @default(cuid())
+  taxonomyNodeType TaxonomyNodeType
+  taxonomyNodeId   String
+  name             String
+  isActive         Boolean          @default(true)
+
+  customerRequired            Boolean         @default(false)
+  customerGeoType             LicenceGeoType?
+  dealerRequired              Boolean         @default(false)
+  dealerGeoType               LicenceGeoType?
+  // Only meaningful when both customerRequired and dealerRequired are true
+  // — the seller uploads one credential that may satisfy both audiences,
+  // while their geographic coverage (customerGeoType/dealerGeoType above)
+  // is still evaluated fully independently. See SellerLicenceSubmission's
+  // separate customerStates/dealerStates lists.
+  sameLicenceForBothAudiences Boolean         @default(false)
+
+  version           Int                 @default(1)
+  previousVersionId String?             @unique
+  previousVersion   LicenceRequirement? @relation("RequirementVersionChain", fields: [previousVersionId], references: [id])
+  nextVersion       LicenceRequirement? @relation("RequirementVersionChain")
+  changeReason      String?
+
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  submissions       SellerLicenceSubmission[]
+  complianceReviews ProductComplianceReview[]
+
+  @@index([taxonomyNodeType, taxonomyNodeId])
+  @@index([isActive])
+}
+
+enum SellerLicenceAudience {
+  CUSTOMER
+  DEALER
+  BOTH
+}
+
+enum LicenceStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  EXPIRED
+  REVOKED
+}
+
+// Replaces the old SellerLicense model, which had no writers anywhere in
+// the app (checkSellerLicenseForProduct was the only reader) and no link
+// to the taxonomy at all. A submission always targets one
+// LicenceRequirement version. customerStates/dealerStates are both empty
+// when the corresponding audience's requirement geoType is PAN_INDIA (same
+// "empty list = nationwide" convention as Product's state lists) and
+// otherwise hold exactly the states this credential covers for that
+// audience — independently of the other audience's coverage.
+model SellerLicenceSubmission {
+  id            String                @id @default(cuid())
+  sellerId      String
+  seller        SellerProfile         @relation(fields: [sellerId], references: [id])
+  requirementId String
+  requirement   LicenceRequirement    @relation(fields: [requirementId], references: [id])
+  audience      SellerLicenceAudience
+
+  customerStates IndianState[] @relation("SellerLicenceCustomerStates")
+  dealerStates   IndianState[] @relation("SellerLicenceDealerStates")
+
+  licenceNumber String
+  expiryDate    DateTime
+
+  documentStorageKey String
+  documentMimeType   String
+  documentSizeBytes  Int
+
+  status           LicenceStatus @default(PENDING_APPROVAL)
+  rejectionReason  String?
+  revocationReason String?
+
+  submittedById  String
+  submittedAt    DateTime  @default(now())
+  reviewedById   String?
+  reviewedAt     DateTime?
+  createdByAdmin Boolean   @default(false)
+
+  // A resubmission (edit after rejection, renewal before/after expiry)
+  // always creates a NEW row rather than overwriting this one, preserving
+  // the previous document/decision/reviewer/reason — see spec §7 "Do not
+  // overwrite compliance history."
+  previousRevisionId String?                  @unique
+  previousRevision   SellerLicenceSubmission? @relation("SubmissionRevisionChain", fields: [previousRevisionId], references: [id])
+  nextRevision       SellerLicenceSubmission? @relation("SubmissionRevisionChain")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  complianceReviews ProductComplianceReview[]
+
+  @@index([sellerId])
+  @@index([requirementId])
+  @@index([status])
+  @@index([expiryDate])
+}
+
+enum ComplianceReviewReason {
+  LICENCE_EXPIRED
+  LICENCE_REJECTED
+  LICENCE_REVOKED
+  REQUIREMENT_ACTIVATED
+  REQUIREMENT_CHANGED
+}
+
+enum ComplianceReviewStatus {
+  OPEN
+  RESOLVED
+}
+
+// One row per (product, audience) compliance event needing admin
+// attention — created automatically whenever a licence invalidation or a
+// requirement activation/change restricts a previously-compliant
+// audience/state combination (spec §10/§11). Never blocks the whole
+// product; the affected audience/state combination is re-derived live from
+// evaluateSellingLicenceEligibility rather than snapshotted here, so this
+// row only needs to record WHY a review was opened, not the full matrix.
+model ProductComplianceReview {
+  id            String                   @id @default(cuid())
+  productId     String
+  product       Product                  @relation(fields: [productId], references: [id])
+  sellerId      String
+  seller        SellerProfile            @relation(fields: [sellerId], references: [id])
+  requirementId String?
+  requirement   LicenceRequirement?      @relation(fields: [requirementId], references: [id])
+  submissionId  String?
+  submission    SellerLicenceSubmission? @relation(fields: [submissionId], references: [id])
+
+  reason           ComplianceReviewReason
+  affectedAudience SellerLicenceAudience
+  detail           String
+
+  status       ComplianceReviewStatus @default(OPEN)
+  createdAt    DateTime               @default(now())
+  resolvedAt   DateTime?
+  resolvedById String?
+
+  @@index([productId])
+  @@index([sellerId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// 10. Notifications
+// ---------------------------------------------------------------------------
+
+model NotificationPreference {
+  id              String  @id @default(cuid())
+  userId          String  @unique
+  user            User    @relation(fields: [userId], references: [id])
+  smsEnabled      Boolean @default(true)
+  whatsappEnabled Boolean @default(false)
+  pushEnabled     Boolean @default(true)
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  title     String
+  body      String
+  imageUrl  String?
+  // Optional click-through target (e.g. a product page). Relative path or
+  // absolute URL, rendered as-is — never validated against a specific
+  // route shape since this model has no notion of "type".
+  linkUrl   String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// A device registered for push notifications. One row per (user, token).
+// `pushToken` is the Expo push token from expo-notifications
+// (getExpoPushTokenAsync). Deleted when the mobile client logs out or when
+// the push provider reports it as no longer registered.
+model PushDevice {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pushToken  String   @unique
+  platform   String   @default("android") // "android" | "ios"
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Per-user cooldown marker for the abandoned-cart nudge (see
+// sweepAbandonedCarts in @kisan4u/orders) so a user is reminded at most
+// once per cooldown window, not on every sweep.
+model CartReminder {
+  userId         String   @id
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastRemindedAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 11. Support & CMS
+// ---------------------------------------------------------------------------
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+model SupportTicket {
+  id         String         @id @default(cuid())
+  customerId String
+  customer   User           @relation(fields: [customerId], references: [id])
+  subject    String
+  category   String
+  priority   TicketPriority @default(MEDIUM)
+  status     TicketStatus   @default(OPEN)
+  createdAt  DateTime       @default(now())
+
+  messages SupportMessage[]
+}
+
+model SupportMessage {
+  id            String        @id @default(cuid())
+  ticketId      String
+  ticket        SupportTicket @relation(fields: [ticketId], references: [id])
+  senderRole    UserRole
+  senderId      String // may reference a User or Admin id depending on senderRole
+  message       String
+  attachmentUrl String?
+  createdAt     DateTime      @default(now())
+}
+
+model ContentPage {
+  id        String   @id @default(cuid())
+  slug      String   @unique // "privacy-policy" | "terms" | "about-us" | ...
+  title     String
+  bodyHtml  String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+// Public /blog. `slug` is the plain-DB-unique @unique field (case-sensitive
+// backstop, matching every other slug in this schema — e.g. Category.slug);
+// real case-insensitive uniqueness is enforced at the application layer via
+// `mode: "insensitive"`, the same convention already used elsewhere in this
+// codebase for name/slug duplicate checks — there's no citext extension or
+// similar in use anywhere here, so this doesn't introduce a new pattern.
+// Original casing is preserved exactly as entered (never lowercased) so the
+// public URL matches what the admin typed.
+model BlogCategory {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  blogs Blog[]
+}
+
+model Blog {
+  id               String       @id @default(cuid())
+  title            String
+  slug             String       @unique
+  headerImageUrl   String
+  headerImageAlt   String
+  categoryId       String
+  category         BlogCategory @relation(fields: [categoryId], references: [id])
+  bodyHtml         String
+  writer           String       @default("Kisan4U Editor")
+  metaDescription  String
+  // Nullable = not shown on the homepage. When set, ordered ascending among
+  // every other featured blog with no gaps/duplicates — see
+  // packages/catalog/src/blog-position.ts, which mirrors
+  // category-hierarchy.ts's setTopLevelCategoryPosition reindex algorithm.
+  featuredPosition Int?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  redirects BlogRedirect[]
+
+  @@index([categoryId])
+  @@index([featuredPosition])
+}
+
+// One row per retired custom URL — checked by /blog/[slug] before returning
+// 404, so an admin changing a blog's URL never breaks a link already shared
+// or indexed. No existing redirect mechanism anywhere else in this codebase
+// to reuse; built fresh for this feature.
+model BlogRedirect {
+  id        String   @id @default(cuid())
+  oldSlug   String   @unique
+  blogId    String
+  blog      Blog     @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 12. Site settings & Homepage CMS (Complete Marketplace Design/Admin Spec
+// §6/§7/§11/§12; Product Card Design Spec's admin-controls table).
+// ---------------------------------------------------------------------------
+
+// A true singleton (fixed id, one row, read via upsert) — deliberately NOT
+// the versioned multi-row "most-recent-active-wins" pattern used by
+// CollectionChargeConfig/PartialPaymentConfig/LogisticsPricingConfig.
+// Those protect *historical order attachment* (a past order's charge must
+// never silently change when a new config row is added); these are global
+// UI/feature toggles with no such requirement, so one mutable row avoids
+// "which row is active" ambiguity for plain booleans.
+model SiteSettings {
+  id                       String   @id @default("singleton")
+  wishlistEnabled          Boolean  @default(true)
+  buyNowEnabled            Boolean  @default(true)
+  addToCartEnabled         Boolean  @default(true)
+  requestSellerEnabled     Boolean  @default(true) // dealer-facing global kill switch
+  ratingDisplayThreshold   Int      @default(5) // card shows rating only if Product.ratingCount >= this
+  defaultDeliveryBadgeText String? // fallback when Product.deliveryBadgeEnabled but text blank
+  footerCustomerCareNumber String?
+  footerPolicyLinks        Json? // [{ label, href }] — config-driven footer, never hardcoded
+  footerSocialLinks        Json? // [{ platform, href }]
+  loginVideoUrl            String? // MP4 played (silent, looping) behind the mobile app's login screen; null = branded gradient fallback. Set from /admin/app-login-video.
+  // Business Associate program global kill switch. Off by default — the
+  // customer-facing "Become a BA" entry points (Account section, referral
+  // capture on registration/checkout, shareable link) stay hidden until an
+  // admin flips this on. The admin BA + BA-settings tabs are always visible
+  // so the program can be configured/tested first.
+  baProgramEnabled         Boolean  @default(false)
+  updatedAt                DateTime @updatedAt
+}
+
+// Admin-configurable rates for the POS-only payment-mode discount
+// (customer orders placed via POS get this discount instead of the
+// hardcoded getCustomerPromoDiscountPercent table web/dealer checkout
+// still uses — see packages/orders/src/pos-pricing.ts). A true singleton
+// like SiteSettings, not the versioned CollectionChargeConfig/
+// PartialPaymentConfig pattern — the resolved rate is read once at
+// order-placement time and baked into that order's own OrderCharge row,
+// so a later config change can never retroactively alter a past order
+// regardless of whether this config itself is versioned.
+// PARTIAL_PREPAID has no discount-independent prepaid-split rate here —
+// the amount collected now is entered per-order by whoever is placing it
+// (admin/employee in POS), not a fixed percentage; see
+// apps/dashboard/.../pos-workspace.tsx's posAdvanceAmountInput and
+// checkout.ts's CheckoutContext.posAdvanceAmount.
+model PosPricingConfig {
+  id                            String   @id @default("singleton")
+  codDiscountPercent            Decimal  @default(0)
+  fullPrepaidDiscountPercent    Decimal  @default(5)
+  partialPrepaidDiscountPercent Decimal  @default(2)
+  updatedAt                     DateTime @updatedAt
+}
+
+enum HomepageSectionType {
+  HERO_BANNER
+  TRUST_STRIP
+  COUPON_STRIP
+  TOP_CATEGORIES
+  DEAL_OF_THE_DAY
+  PRODUCT_DISCOVERY_TRENDING
+  PRODUCT_DISCOVERY_BEST_SELLERS
+  PRODUCT_DISCOVERY_NEW_ARRIVALS
+  JOIN_DEALER_SELLER
+  FEATURED_BY_CATEGORY
+  SHOP_BY_BRAND
+}
+
+enum SectionAudience {
+  CUSTOMER
+  DEALER
+  COMMON
+}
+
+// One row per homepage section instance, ordered by `position`. Status is
+// deliberately collapsed to `enabled` + `startAt`/`endAt` rather than the
+// spec's full DRAFT/SCHEDULED/PUBLISHED/EXPIRED/ARCHIVED state machine —
+// every one of those states is a pure function of (enabled, startAt, endAt,
+// now) except archived-vs-published, which `enabled` itself captures; no
+// other record references a HomepageSection row, so no soft-delete audit
+// trail is needed here (unlike, say, Order rows).
+model HomepageSection {
+  id        String              @id @default(cuid())
+  type      HomepageSectionType
+  position  Int                 @default(0)
+  enabled   Boolean             @default(true)
+  audience  SectionAudience     @default(COMMON)
+  startAt   DateTime?
+  endAt     DateTime?
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  @@unique([type, audience])
+}
+
+enum PromotionalPlacement {
+  HERO
+  COUPON
+  HERO_SECONDARY
+  JOIN_DEALER
+  JOIN_SELLER
+}
+
+model PromotionalAsset {
+  id              String               @id @default(cuid())
+  placement       PromotionalPlacement
+  audience        SectionAudience      @default(COMMON)
+  // Storefront language this asset is shown to. EN is the default/fallback:
+  // when a viewer's language has no asset for a given placement+audience,
+  // the storefront falls back to the EN rows (see
+  // packages/catalog/src/homepage.ts getEligiblePromotionalAssets).
+  language        Language             @default(EN)
+  // Which surface this HERO/COUPON asset belongs to: null = the storefront
+  // home page ("Home page / All"); set = that category's own page
+  // (Homepage redesign, phase A).
+  categoryId      String?
+  category        Category?            @relation(fields: [categoryId], references: [id])
+  desktopImageUrl String
+  mobileImageUrl  String?
+  altText         String
+  linkUrl         String? // validated at the validators layer: relative path or https:// only, no javascript:/data:
+  ctaLabel        String?
+  priority        Int                  @default(0) // slide order within HERO carousel; ignored for single-image placements
+  startAt         DateTime?
+  endAt           DateTime?
+  isActive        Boolean              @default(true)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  @@index([placement, isActive, audience, language])
+  @@index([categoryId])
+}
+
+// A distinct square homepage image per category — deliberately NOT reusing
+// Category.imageUrl (Complete Design/Admin Spec §7.4/§11.4: "do not
+// overwrite the standard category image used elsewhere").
+model CategoryHomepageAsset {
+  id         String   @id @default(cuid())
+  categoryId String   @unique
+  category   Category @relation(fields: [categoryId], references: [id])
+  imageUrl   String
+  position   Int      @default(0)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// Explicit, independent deal price — never mutates ProductCustomerConfig/
+// ProductDealerConfig. Expiry is enforced authoritatively in
+// packages/orders/src/pricing-resolution.ts (the same call site every
+// other price resolves through), not just as a UI countdown, so a stale
+// browser tab can never purchase at an expired deal price.
+model DealOfTheDay {
+  id        String          @id @default(cuid())
+  productId String
+  product   Product         @relation(fields: [productId], references: [id])
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id])
+  dealPrice Decimal
+  startAt   DateTime
+  endAt     DateTime
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@index([isActive, startAt, endAt])
+}
+
+enum MerchandisingType {
+  TRENDING
+  BEST_SELLERS
+  NEW_ARRIVALS
+  FEATURED_BY_CATEGORY
+  FEATURED_BY_SUBCATEGORY
+}
+
+// HYBRID (pinned-then-ranked) is intentionally not modeled yet — no sales-
+// velocity/order-count signal exists anywhere in the schema to rank by, so
+// a pinned+ranked mode would be speculative. MerchandisingItem.pinned is
+// modeled now so HYBRID can be added later with zero migration pain.
+enum MerchandisingMode {
+  MANUAL
+  AUTOMATIC
+}
+
+model MerchandisingCollection {
+  id            String            @id @default(cuid())
+  type          MerchandisingType
+  mode          MerchandisingMode @default(AUTOMATIC)
+  categoryId    String? // set only for FEATURED_BY_CATEGORY — one collection row per featured category
+  category      Category?         @relation(fields: [categoryId], references: [id])
+  // Set only for FEATURED_BY_SUBCATEGORY — one collection row per featured
+  // subcategory, same convention as categoryId above. A separate unique
+  // constraint from [type, categoryId] rather than one combined
+  // [type, categoryId, subCategoryId] — Postgres treats a NULL column as
+  // never equal to itself in a unique constraint, so a single combined
+  // constraint would silently fail to block duplicate subcategory rows
+  // (categoryId is always NULL for this type).
+  subCategoryId String?
+  subCategory   Subcategory?      @relation(fields: [subCategoryId], references: [id])
+  isActive      Boolean           @default(true)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  items MerchandisingItem[]
+
+  @@unique([type, categoryId])
+  @@unique([type, subCategoryId])
+}
+
+model MerchandisingItem {
+  id           String                  @id @default(cuid())
+  collectionId String
+  collection   MerchandisingCollection @relation(fields: [collectionId], references: [id])
+  productId    String
+  product      Product                 @relation(fields: [productId], references: [id])
+  position     Int                     @default(0)
+  pinned       Boolean                 @default(false) // unused by MANUAL/AUTOMATIC modes today; reserved for future HYBRID
+  createdAt    DateTime                @default(now())
+
+  @@unique([collectionId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// 13. Seller Settlements — per-order-item seller payout ledger. One row per
+// OrderItem (orderItemId is unique — this is the duplicate-prevention
+// constraint required for idempotent settlement creation), created once its
+// SellerOrder transitions to DELIVERED (see
+// packages/orders/src/settlement.ts:upsertSettlementForOrderItem, called
+// from order-workflow.ts:markDelivered). Every financial input and every
+// rate is snapshotted at creation time so a later commission/tax/rate-config
+// edit, or a product/customer/seller detail edit, can never change what a
+// past settlement shows it was calculated from — the same "snapshot, never
+// re-derive" convention as OrderItem/OrderCharge above. A settled row is
+// never mutated or deleted; later corrections (return/refund/RTO/
+// chargeback/manual) are always a new SettlementAdjustment row referencing
+// it, never an overwrite.
+// ---------------------------------------------------------------------------
+
+enum SettlementStatus {
+  PENDING // delivered, still inside the post-delivery hold period
+  ON_HOLD // held for manual review (e.g. data ambiguity)
+  ELIGIBLE // hold period has passed, ready for payout processing
+  PROCESSING // admin has started processing payout for this row
+  SETTLED // paid out to the seller (a manual admin action — no automatic
+  // payout integration exists yet, see settlement.ts doc comment)
+  PARTIALLY_SETTLED // settled, then partially reversed by an adjustment
+  REVERSED // fully reversed by adjustment(s) (return/refund/RTO/
+  // cancellation/chargeback occurring after eligibility)
+  FAILED // calculation could not be completed reliably from available data
+  NEEDS_REVIEW // e.g. a negative payable — never silently clamped to 0
+}
+
+// PERCENTAGE is the only type with real data behind it today
+// (SellerProfile.commissionPercent/dealerCommissionPercent). FIXED is
+// reserved for a future per-seller fixed-commission field/business rule —
+// deliberately not implemented yet, since inventing a per-unit-vs-per-item
+// rule with no basis anywhere in the existing code would be a guess, not a
+// mapping (see settlement-calculator.ts doc comment).
+enum CommissionType {
+  PERCENTAGE
+  FIXED
+}
+
+enum SettlementAdjustmentReason {
+  RETURN
+  REFUND
+  CANCELLATION
+  RTO
+  CHARGEBACK
+  MANUAL_CORRECTION
+}
+
+// True singleton (fixed id, like SiteSettings) — the post-delivery hold
+// period before a settlement may move PENDING -> ELIGIBLE. No return/refund
+// window config existed anywhere in the codebase before this; holdDays is a
+// new, explicit, admin-editable business rule (see admin/order-settings).
+model SettlementSettings {
+  id        String   @id @default("singleton")
+  // Post-delivery hold before a settlement moves PENDING -> ELIGIBLE. Also
+  // the customer's return window: a return can only be requested within
+  // this same period (refunds.ts:requestReturn), so a settlement is still
+  // PENDING for the whole time a return is possible and can be cleanly
+  // voided if one is approved. Default 2 = 48 hours (business rule as of
+  // the settlement-cycles change; still admin-editable).
+  holdDays  Int      @default(2)
+  updatedAt DateTime @updatedAt
+}
+
+// Commission-GST%, logistics-GST%, and collection-charge-GST% did not exist
+// as configurable rates anywhere before this (only
+// SellerProfile.commissionPercent/dealerCommissionPercent existed, and those
+// were never read anywhere in order calculation). Versioned, most-specific-
+// wins resolution — the same "seller override wins, else platform default"
+// precedent as ShippingMethod.sellerId (see
+// packages/orders/src/charges.ts:resolveDealerTransportCharge) — extended
+// one step further with an optional customerType axis so Dealer vs Customer
+// rates can differ per seller. Resolution order (see settlement-rates.ts):
+//   (sellerId, customerType) match > (sellerId, customerType=null) >
+//   (sellerId=null, customerType match) > (sellerId=null, customerType=null)
+// isActive lets an admin retire/replace a row without deleting it — an
+// existing settlement's snapshot is unaffected either way.
+// TCS (0.5%) and TDS (0.1%) are deliberately NOT columns here — they are
+// fixed statutory rates, never admin-editable (see
+// settlement-rates.ts:FIXED_TCS_PERCENT/FIXED_TDS_PERCENT). A prior version
+// of this model had tcsPercent/tdsPercent columns; a corrective migration
+// dropped them (never exposed via any admin UI, so no live data depended on
+// them) — SellerSettlement.tcsRatePercent/tdsRatePercent still snapshot the
+// applied rate per row for audit purposes.
+model SettlementRateConfig {
+  id                         String         @id @default(cuid())
+  label                      String
+  sellerId                   String?
+  seller                     SellerProfile? @relation(fields: [sellerId], references: [id])
+  customerType               UserRole?
+  commissionGstPercent       Decimal
+  logisticsGstPercent        Decimal
+  collectionChargeGstPercent Decimal
+  isActive                   Boolean        @default(true)
+  isDemo                     Boolean        @default(true)
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
+
+  @@index([sellerId, customerType, isActive])
+}
+
+model SellerSettlement {
+  id String @id @default(cuid())
+
+  sellerId        String
+  seller          SellerProfile @relation(fields: [sellerId], references: [id])
+  checkoutGroupId String
+  checkoutGroup   CheckoutGroup @relation(fields: [checkoutGroupId], references: [id])
+  sellerOrderId   String
+  sellerOrder     SellerOrder   @relation(fields: [sellerOrderId], references: [id])
+  // The single row per OrderItem, and therefore the duplicate-prevention
+  // constraint required for idempotent settlement creation.
+  orderItemId     String        @unique
+  orderItem       OrderItem     @relation(fields: [orderItemId], references: [id])
+  // Informational references only (not strict FKs), matching the existing
+  // OrderItem.productId/variantId convention — a product/variant may be
+  // edited or removed later without invalidating a historical settlement,
+  // whose display fields are all separately snapshotted below.
+  productId       String
+  variantId       String?
+
+  currency String @default("INR")
+
+  // --- Audit snapshots (immutable once written) ---
+  orderDateTime           DateTime
+  financialStatusSnapshot PaymentStatus
+  orderStatusSnapshot     OrderStatus
+  shippingStateSnapshot   String
+  productNameSnapshot     String
+  shopNameSnapshot        String
+  customerNameSnapshot    String
+  customerTypeSnapshot    UserRole
+  paymentMethodSnapshot   PaymentMethod
+
+  fulfilledQty Int
+
+  // --- Financial inputs & calculated components (all snapshotted) ---
+  // Per-unit figures ("Product Price" / "Net Sales After All Deductions" /
+  // "Product Price Inc(Tax)" in the required Excel columns) vs. line-total
+  // figures ("Total Sales" etc.) — see settlement.ts doc comment for the
+  // full column-mapping rationale.
+  unitPrice                Decimal
+  unitPriceNetOfDeductions Decimal
+  unitPriceIncTax          Decimal
+  totalSales               Decimal
+  netSalesExclTax          Decimal
+  gstRatePercent           Decimal
+  gstTax                   Decimal
+
+  commissionType           CommissionType @default(PERCENTAGE)
+  commissionValuePercent   Decimal
+  commissionBase           Decimal
+  grossCommission          Decimal
+  commissionGstRatePercent Decimal
+  grossCommissionTax       Decimal
+
+  // v4 (settlement order-level allocation task): logistics and collection
+  // charge are now calculated ONCE per seller order (combined shipment
+  // weight -> one slab; combined net value -> one collection charge), then
+  // allocated back across this seller order's line items proportionally —
+  // never independently re-derived per item (that was v3's behavior; see
+  // SETTLEMENT_CALCULATION_VERSION in settlement.ts). logisticSellerBorne/
+  // logisticTax/collectionCharge/collectionChargeTax below still mean
+  // exactly what they always meant ("this line's share of the charge/tax"),
+  // just now sourced from an allocation instead of an independent per-item
+  // calculation — no rename needed. The sellerOrder*/line* fields below are
+  // new: they snapshot the shared order-level totals and this line's own
+  // weight/value share, repeated identically across every row of the same
+  // seller order, so a reader (table/export) can display and reconcile
+  // "Total Shipment Weight"/"Logistics Slab" without re-deriving them from
+  // sibling rows or the live OrderItem/LogisticsPricingConfig (which may
+  // change after this settlement is finalized).
+  lineWeightGrams             Int     @default(0) // this line's own weight share (unitWeightGrams x fulfilledQty), frozen at settlement time
+  sellerOrderTotalWeightGrams Int     @default(0) // denominator for logistics allocation — sum of lineWeightGrams across every item in this seller order
+  logisticsSlabSnapshot       Json? // the matched slab at seller-order level: { lowerWeightGrams, upperWeightGrams, price, aboveMax, configId } — null only for a pre-v4 row or a NEEDS_REVIEW row where no slab could be matched
+  sellerOrderLogisticsCharge  Decimal @default(0) // order-level total logistics charge (same value on every row of this seller order)
+  sellerOrderLogisticsTax     Decimal @default(0) // order-level total logistics tax (same value on every row of this seller order)
+  sellerOrderTotalNetValue    Decimal @default(0) // denominator for collection-charge allocation — sum of totalSales across every item in this seller order
+  sellerOrderCollectionCharge Decimal @default(0) // order-level total collection charge (same value on every row of this seller order)
+  sellerOrderCollectionTax    Decimal @default(0) // order-level total collection-charge tax (same value on every row of this seller order)
+
+  logisticSellerBorne            Decimal @default(0) // this line's allocated share of sellerOrderLogisticsCharge
+  logisticGstRatePercent         Decimal @default(0)
+  logisticTax                    Decimal @default(0) // this line's allocated share of sellerOrderLogisticsTax
+  collectionCharge               Decimal @default(0) // this line's allocated share of sellerOrderCollectionCharge
+  collectionChargeGstRatePercent Decimal @default(0)
+  collectionChargeTax            Decimal @default(0) // this line's allocated share of sellerOrderCollectionTax
+
+  tcsRatePercent Decimal
+  tcsAmount      Decimal
+  tdsRatePercent Decimal
+  tdsAmount      Decimal
+
+  // Business Associate commission borne by this seller (BA program). Only
+  // non-zero when the buyer was referred by a BA and SiteSettings.
+  // baProgramEnabled was on at order time. Computed per seller order
+  // (that seller's own BaRateConfig % x this seller order's
+  // customerPayableTotal), then allocated across its line items
+  // proportionally by totalSales — same allocation model as logistics /
+  // collection charge above. baCommissionGst is 18% of baCommission. Both
+  // are deductions from payableToSeller and are snapshotted here so a later
+  // BaRateConfig edit never changes what a past settlement shows.
+  baCommission               Decimal @default(0) // this line's allocated share of the seller-order BA commission
+  baCommissionGstRatePercent Decimal @default(0)
+  baCommissionGst            Decimal @default(0) // 18% GST on this line's baCommission share
+  sellerOrderBaCommission    Decimal @default(0) // seller-order-level total BA commission (same value on every row of this seller order)
+  sellerOrderBaCommissionGst Decimal @default(0)
+
+  payableToSeller    Decimal
+  calculationVersion Int     @default(1)
+
+  status          SettlementStatus @default(PENDING)
+  eligibleAt      DateTime?
+  // The payout batch this row belongs to — 00:00 IST on the 9th / 19th /
+  // 29th (see packages/orders/src/settlement-cycle.ts). Derived from
+  // eligibleAt and written at row creation; recomputed only while the row
+  // is still in RECOMPUTABLE_STATUSES (same lifecycle as eligibleAt), then
+  // frozen. Null only for a row created before this column existed and not
+  // yet backfilled (backfillSettlementCycleDates). The admin Settlements
+  // page groups sellers by an exact match on this value.
+  cyclePayoutDate DateTime?
+  settledAt       DateTime?
+  reviewNote      String?
+  // The actual delivery-event timestamp (OrderStatusHistory's DELIVERED row,
+  // captured once at settlement-row creation, in the same transaction as
+  // that status write — see order-workflow.ts:applyMockLogisticsEventForOrder
+  // and settlement.ts:upsertSettlementsForSellerOrder). Deliberately NOT
+  // derived from updatedAt (which changes on unrelated edits) and
+  // deliberately never overwritten on a later recompute of the same row.
+  // Null for a row created before this column existed and whose order has no
+  // DELIVERED OrderStatusHistory entry to backfill from — the UI must show
+  // "Not recorded" rather than invent a date.
+  deliveredAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  adjustments SettlementAdjustment[]
+
+  @@index([sellerId])
+  @@index([sellerOrderId])
+  @@index([checkoutGroupId])
+  @@index([status])
+  @@index([cyclePayoutDate])
+  @@index([cyclePayoutDate, sellerId])
+}
+
+// Append-only reversal/correction trail — never mutates or deletes the
+// SellerSettlement it references ("do not delete or silently overwrite the
+// historical settled record").
+model SettlementAdjustment {
+  id            String                     @id @default(cuid())
+  settlementId  String
+  settlement    SellerSettlement           @relation(fields: [settlementId], references: [id])
+  reason        SettlementAdjustmentReason
+  amount        Decimal // signed: negative reduces payable, positive corrects upward
+  note          String?
+  referenceType String? // e.g. "RefundRequest" | "OrderStatusHistory" | "Manual"
+  referenceId   String?
+  createdByRole UserRole
+  createdById   String
+  createdAt     DateTime                   @default(now())
+
+  @@index([settlementId])
+}
+
+// ---------------------------------------------------------------------------
+// 14. Bulk product entry ("Add Multiple Products" spreadsheet) — a draft
+// session holding one or more Product Groups, each with one or more
+// sellable rows, persisted as structured JSON (never a raw flat
+// spreadsheet dump) so it survives a refresh and autosaves incrementally
+// before anything is submitted through the real product services
+// (packages/catalog/src/product-submission.ts:applyProductSubmission,
+// the same engine the single-product form uses — this feature is an
+// alternate INPUT surface for that engine, never a competing one).
+//
+// sharedData/rowData are validated Json blobs (see
+// packages/validators/src/bulk-product.ts) rather than a fully normalized
+// column-per-field schema — every reference inside them (categoryId,
+// brandId, attributeId, stateId, editorialBadgeId, attribute-value refs)
+// is a stable database id, never a display string, satisfying "do not
+// save dynamic selections only as display text" without needing a
+// separate column for every one of the ~40 shared/row fields the sheet
+// exposes. existingProductId/existingVariantId are informational only —
+// no enforced FK — matching this schema's existing convention for a
+// cross-reference that must survive the referenced row being edited or
+// removed elsewhere (see OrderItem.variantId's identical doc comment):
+// a draft can live for days, and re-validating that reference at
+// load/submit time (ownership, current existence) is both necessary and
+// sufficient, an enforced FK would only add cascade-behavior questions
+// with no real safety benefit.
+// ---------------------------------------------------------------------------
+
+enum BulkDraftStatus {
+  OPEN
+  SUBMITTING
+  COMPLETED
+  ARCHIVED
+}
+
+model BulkProductDraft {
+  id   String @id @default(cuid())
+  name String
+
+  sellerId String? // null = admin/in-house draft
+  seller   SellerProfile? @relation(fields: [sellerId], references: [id])
+
+  createdByUserId String
+  createdByUser   User   @relation(fields: [createdByUserId], references: [id])
+
+  status BulkDraftStatus @default(OPEN)
+
+  // Optimistic-concurrency guard for "two browser tabs editing the same
+  // draft" — every group/row mutation bumps this and is rejected (409-
+  // style result, never silently overwritten) if the caller's last-seen
+  // version doesn't match. Deliberately draft-level, not per-group/row: a
+  // coarser but simple and honestly-documented tradeoff — two tabs
+  // editing DIFFERENT groups in the same draft still conflict, but a
+  // true per-row CRDT/OT merge engine is far outside this feature's scope.
+  version Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  groups BulkProductGroup[]
+
+  @@index([sellerId])
+  @@index([createdByUserId])
+  @@index([status])
+}
+
+// One row per "Product Group ID" in the sheet — the anchor for shared
+// product information, per spec's "only one anchor/master row... directly
+// edits shared information."
+model BulkProductGroup {
+  id      String           @id @default(cuid())
+  draftId String
+  draft   BulkProductDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  // The user-facing Product Group ID text shown in the sheet — client-
+  // generated (auto) or typed by the seller/admin, unique only within
+  // this one draft (not globally: two different drafts may reuse the
+  // same human-chosen id text before either is submitted).
+  groupKey String
+
+  // Set once this group is matched to/loaded from a real, already-saved
+  // Product (spec: "If the Product Group ID belongs to a product already
+  // saved in the database... Retain stable database identifiers
+  // internally"). Informational only — see the model-block doc comment.
+  existingProductId String?
+
+  hasVariants Boolean          @default(false)
+  audience    ProductAudience?
+
+  // Which seller this group's product(s) will be created/updated under —
+  // only meaningful (and only settable) on an admin-owned draft, where one
+  // sheet can assign different groups to different sellers. Always null
+  // and always ignored on a seller-owned draft: a seller can only ever
+  // submit for themselves (see submitBulkDraft), so storing it there would
+  // be redundant. A real FK, not informational-only like existingProductId
+  // — this is a genuine assignment decision made at draft time, not a
+  // pointer into another system of record.
+  sellerId String?
+  seller   SellerProfile? @relation("BulkProductGroupSeller", fields: [sellerId], references: [id])
+
+  // Every shared/basic/classification/description/SEO/badge field the
+  // group's anchor row edits — validated against bulkGroupSharedDataSchema
+  // (packages/validators/src/bulk-product.ts) on every write, not just at
+  // submission time.
+  sharedData Json
+
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rows BulkProductRow[]
+
+  @@unique([draftId, groupKey])
+  @@index([draftId])
+  @@index([existingProductId])
+  @@index([sellerId])
+}
+
+// One row per sellable unit within a group — one audience, and (for a
+// variant product) one attribute combination.
+model BulkProductRow {
+  id      String           @id @default(cuid())
+  groupId String
+  group   BulkProductGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  audience VariantAudience
+
+  // Set once this row is matched to/loaded from a real ProductVariant (or,
+  // for a non-variant group, the audience's base config row uses
+  // existingProductId on the parent group instead — a non-variant row has
+  // no ProductVariant of its own to reference). Informational only — see
+  // the model-block doc comment.
+  existingVariantId String?
+
+  // sku/hsnCode/pricing/inventory/state-availability/shipping/physical/
+  // variant-attribute-value-refs/image-overrides — validated against
+  // bulkRowDataSchema on every write.
+  rowData Json
+
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([groupId])
+  @@index([existingVariantId])
+}

@@ -1,0 +1,85 @@
+{
+  "expo": {
+    "name": "Kisan4U",
+    "slug": "kisan4u",
+    "owner": "jiteshkisan4u",
+    "version": "3.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "kisan4u",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#F6F8F5",
+    "androidNavigationBar": {
+      "barStyle": "dark-content",
+      "backgroundColor": "#FFFFFF"
+    },
+    "android": {
+      "package": "com.kisan4u.katra",
+      "versionCode": 94,
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "backgroundImage": "./assets/images/android-icon-background.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            { "scheme": "https", "host": "katra4u.com", "pathPrefix": "/r/" },
+            { "scheme": "https", "host": "katra4u.com", "pathPrefix": "/products/" },
+            {
+              "scheme": "https",
+              "host": "katra4u.com",
+              "pathPrefix": "/dealer/products/"
+            },
+            { "scheme": "https", "host": "katra4u.com", "pathPrefix": "/c/" },
+            { "scheme": "https", "host": "katra4u.com", "pathPrefix": "/crops/" },
+            { "scheme": "https", "host": "katra4u.com", "pathPrefix": "/pest-disease/" },
+            { "scheme": "https", "host": "katra4u.com", "path": "/register/dealer" },
+            { "scheme": "https", "host": "katra4u.com", "path": "/account/ba" }
+          ],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.kisan4u.katra",
+      "associatedDomains": ["applinks:katra4u.com"]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#FFFFFF",
+          "image": "./assets/images/splash-logo.png",
+          "imageWidth": 240
+        }
+      ],
+      "./plugins/withKisan4uAndroidColors.js",
+      "./plugins/withUpiQueries.js",
+      "./plugins/withRelatedAppsStatement.js",
+      "expo-sharing",
+      [
+        "expo-notifications",
+        {
+          "color": "#2B6B3D"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "apiUrl": "https://katra4u.com",
+      "router": {},
+      "eas": {
+        "projectId": "421db2ce-789a-4853-bdbe-4b6530521bda"
+      }
+    }
+  }
+}

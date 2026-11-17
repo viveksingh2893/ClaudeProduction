@@ -1,0 +1,56 @@
+# Dependencies
+node_modules
+.pnpm/
+.pnpm-store
+
+# Next.js
+.next
+out
+
+# Turborepo
+.turbo
+
+# Build output
+dist
+build
+generated
+*.tsbuildinfo
+
+# Env files (never commit real values — .env.example files ARE committed)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# Prisma
+packages/db/generated
+
+# Database dumps — never belong in git history (size + real customer data)
+*.dump
+
+# Test-data-cleanup manifests/backups — contain real record ids/names/emails
+# and full database dumps; generated locally per-run, never committed.
+packages/orders/test-data-cleanup-output
+
+# Legacy customer migration inputs/outputs — real customer PII (names,
+# phones, emails), pulled from the old server for a one-time ETL run.
+packages/db/legacy-export
+
+# User-uploaded files (local-disk storage provider, see packages/providers/src/storage.ts)
+apps/web/storage/uploads
+apps/dashboard/storage
+# Defensive: localStorageProvider resolves relative to process.cwd(), so a
+# script/tool run from packages/db (e.g. a legacy-migration script) can
+# write here by accident instead of apps/web/storage/uploads — see
+# migrate-legacy-dealers.ts's real incident.
+packages/db/storage

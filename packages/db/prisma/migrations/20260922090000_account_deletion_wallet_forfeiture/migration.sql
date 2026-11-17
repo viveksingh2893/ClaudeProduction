@@ -1,0 +1,4 @@
+ALTER TYPE "TransactionReason" ADD VALUE 'ACCOUNT_DELETION_FORFEITURE';
+
+ALTER TABLE "AccountDeletionRequest"
+  ADD COLUMN "walletForfeitureAccepted" BOOLEAN NOT NULL DEFAULT FALSE;

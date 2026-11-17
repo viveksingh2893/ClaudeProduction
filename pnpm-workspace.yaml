@@ -1,0 +1,24 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+virtualStoreDir: .pnpm
+virtualStoreDirMaxLength: 26
+overrides:
+  # Every package declares "@types/node": "*" — but exceljs (packages/orders,
+  # settlement CSV export) transitively pulls in an ancient @fast-csv@4 that
+  # pins @types/node@14.18.63. pnpm's isolated node_modules structure then
+  # gives different packages different resolved @types/node versions
+  # depending on which dependency chain reaches them, which surfaces as a
+  # spurious Buffer/Uint8Array structural-type conflict the moment any
+  # package's tsc run reaches a file using newer Node buffer APIs through a
+  # different package's node_modules than it was directly installed under
+  # (see packages/providers/src/storage.ts's sharp/Buffer usage, first
+  # affected by this since it's the first real user of that surface). One
+  # consistent version workspace-wide removes the conflict entirely.
+  "@types/node": "^26.1.1"
+allowBuilds:
+  "@prisma/engines": true
+  esbuild: true
+  prisma: true
+  sharp: true
+  unrs-resolver: true

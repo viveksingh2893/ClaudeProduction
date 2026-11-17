@@ -1,0 +1,33 @@
+{
+  "name": "kisan4u-nextjs",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.15.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "dev:web": "turbo run dev --filter=web",
+    "dev:dashboard": "turbo run dev --filter=dashboard",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:generate": "pnpm --filter @kisan4u/db run generate",
+    "db:migrate": "pnpm --filter @kisan4u/db run migrate",
+    "db:studio": "pnpm --filter @kisan4u/db run studio",
+    "db:seed": "pnpm --filter @kisan4u/db run seed",
+    "seed:demo": "pnpm --filter @kisan4u/db run seed:demo",
+    "seed:demo:remove": "pnpm --filter @kisan4u/db run seed:demo:remove",
+    "db:validate": "pnpm --filter @kisan4u/db run validate",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "turbo": "*",
+    "prettier": "*",
+    "typescript": "^5.7.0"
+  }
+}

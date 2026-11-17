@@ -1,0 +1,30 @@
+name: kisan4u-nextjs
+
+# Local development only. This must never be pointed at a production
+# database or credentials — see project constraints in PHASE_0_SETUP.md.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kisan4u_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kisan4u_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kisan4u_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-kisan4u_dev}
+    ports:
+      # Default 6100, not 5432/5433: 5432 collides with a locally-installed
+      # native Postgres, and 5433 falls inside a Windows dynamic TCP
+      # port-exclusion range (Hyper-V/WSL) on some machines, which silently
+      # blocks Docker from binding it. Override with POSTGRES_PORT if 6100
+      # doesn't work for you either.
+      - "${POSTGRES_PORT:-6100}:5432"
+    volumes:
+      - kisan4u_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kisan4u_dev}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  kisan4u_postgres_data:

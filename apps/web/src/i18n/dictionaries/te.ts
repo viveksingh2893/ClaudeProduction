@@ -1,0 +1,92 @@
+import type { Dictionary } from "./en";
+
+/**
+ * Telugu (తెలుగు). Machine/assisted translation of storefront chrome —
+ * recommend a native speaker review before a wide rollout.
+ */
+export const te: Dictionary = {
+  ribbon: {
+    becomeDealer: "డీలర్‌గా మారండి",
+    corporateWebsite: "కార్పొరేట్ వెబ్‌సైట్",
+    language: "భాష",
+    chooseLanguage: "భాషను ఎంచుకోండి",
+  },
+  nav: {
+    home: "హోమ్",
+    products: "ఉత్పత్తులు",
+    wishlist: "కోరికల జాబితా",
+    cart: "కార్ట్",
+    orders: "ఆర్డర్‌లు",
+    account: "ఖాతా",
+    login: "లాగిన్",
+    productRequests: "ఉత్పత్తి అభ్యర్థనలు",
+    alerts: "హెచ్చరికలు",
+    notifications: "నోటిఫికేషన్‌లు",
+    categories: "వర్గాలు",
+    doctor: "డాక్టర్",
+    comingSoon: "త్వరలో వస్తుంది",
+    search: "ఉత్పత్తులు, బ్రాండ్‌లు మరియు మరిన్ని వెతకండి",
+    signOut: "సైన్ అవుట్",
+  },
+  doctorPage: {
+    title: "కిసాన్4యూ డాక్టర్ త్వరలో వస్తుంది",
+    subtitle: "వేచి ఉండండి",
+  },
+  home: {
+    bestSellers: "బెస్ట్ సెల్లర్‌లు",
+    trendingNow: "ఇప్పుడు ట్రెండింగ్",
+    shopByBrand: "బ్రాండ్ ప్రకారం కొనండి",
+    shopByCrop: "పంట ప్రకారం కొనండి",
+    shopByPestDisease: "పురుగు & వ్యాధి ప్రకారం కొనండి",
+    viewAll: "అన్నీ చూడండి",
+  },
+  pdp: {
+    description: "వివరణ",
+    ingredients: "పదార్థాలు",
+    howToUse: "ఎలా ఉపయోగించాలి",
+    dosage: "మోతాదు",
+    technicalInfo: "సాంకేతిక సమాచారం",
+    addToCart: "కార్ట్‌కు జోడించండి",
+    buyNow: "ఇప్పుడే కొనండి",
+    outOfStock: "స్టాక్ లేదు",
+  },
+  footer: {
+    tagline:
+      "వ్యవసాయ ఉత్పాదకాలు మరియు సాధారణ వస్తువుల కోసం మల్టీ-సెల్లర్ మార్కెట్‌ప్లేస్ — ముందు డీలర్/టోకు, తర్వాత అందరికీ రిటైల్.",
+    customerCare: "కస్టమర్ కేర్",
+    shop: "షాప్",
+    legal: "చట్టపరమైన",
+    more: "మరిన్ని",
+    allProducts: "అన్ని ఉత్పత్తులు",
+    trackOrder: "ఆర్డర్ ట్రాక్ చేయండి",
+    becomeDealer: "డీలర్‌గా మారండి",
+    becomeSeller: "విక్రేతగా మారండి",
+    rightsReserved: "అన్ని హక్కులు ప్రత్యేకించబడ్డాయి.",
+  },
+  account: {
+    welcome: "స్వాగతం",
+    welcomeName: "స్వాగతం, {name}",
+    loggedInAs: "{role}గా లాగిన్ అయ్యారు",
+    roleCustomer: "కస్టమర్",
+    roleDealer: "డీలర్",
+    browseProducts: "ఉత్పత్తులను చూడండి",
+    dealerCatalogue: "డీలర్ కేటలాగ్",
+    myRequests: "నా అభ్యర్థనలు",
+    cart: "కార్ట్",
+    myOrders: "నా ఆర్డర్‌లు",
+    savedAddresses: "సేవ్ చేసిన చిరునామాలు",
+    wallet: "Kisan4U వాలెట్",
+    profile: "ప్రొఫైల్",
+    businessAssociate: "బిజినెస్ అసోసియేట్",
+    walletBalance: "Kisan4U వాలెట్ నిల్వ",
+    manageWallet: "వాలెట్‌ను నిర్వహించండి",
+  },
+  cookieConsent: {
+    title: "మేము కుకీలను ఉపయోగిస్తాము",
+    message: "మీరు Kisan4U ను ఎలా ఉపయోగిస్తున్నారో అర్థం చేసుకోవడానికి మరియు మీకు ఉపయోగకరమైన ఆఫర్‌లను చూపించడానికి మేము Meta (Facebook) కుకీలతో సహా కుకీలను ఉపయోగిస్తాము. ఫుటర్‌లోని కుకీ సెట్టింగ్‌ల నుండి మీరు దీన్ని ఎప్పుడైనా మార్చవచ్చు.",
+    accept: "అంగీకరించండి",
+    decline: "తిరస్కరించండి",
+    privacy: "గోప్యతా విధానం",
+    settings: "కుకీ సెట్టింగ్‌లు",
+  },
+};

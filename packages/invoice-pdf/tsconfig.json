@@ -1,0 +1,4 @@
+{
+  "extends": "@kisan4u/config/typescript/nextjs.json",
+  "include": ["src"]
+}

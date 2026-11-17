@@ -1,0 +1,25 @@
+{
+  "name": "@kisan4u/invoice-pdf",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "peerDependencies": {
+    "react": "^19.2.7"
+  },
+  "dependencies": {
+    "@kisan4u/orders": "workspace:*",
+    "@react-pdf/renderer": "^4.9.0"
+  },
+  "devDependencies": {
+    "@kisan4u/config": "workspace:*",
+    "@types/react": "*",
+    "eslint": "*",
+    "next": "15",
+    "typescript": "^5.7.0"
+  }
+}

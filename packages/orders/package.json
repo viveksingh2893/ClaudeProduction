@@ -1,0 +1,33 @@
+{
+  "name": "@kisan4u/orders",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "tsx --test src/**/*.test.ts",
+    "backfill:settlements": "tsx scripts/backfill-seller-settlements.ts",
+    "bulk-price-update:katra-royal": "tsx scripts/bulk-price-update-katra-royal.ts",
+    "test-data-cleanup:preview": "tsx scripts/test-data-cleanup-cli.ts preview",
+    "test-data-cleanup:manifest": "tsx scripts/test-data-cleanup-cli.ts manifest",
+    "test-data-cleanup:apply": "tsx scripts/test-data-cleanup-cli.ts apply"
+  },
+  "dependencies": {
+    "@kisan4u/catalog": "workspace:*",
+    "@kisan4u/db": "workspace:*",
+    "@kisan4u/providers": "workspace:*",
+    "@kisan4u/validators": "workspace:*",
+    "exceljs": "^4.4.0",
+    "expo-server-sdk": "^7.2.0"
+  },
+  "devDependencies": {
+    "@kisan4u/auth": "workspace:*",
+    "@kisan4u/config": "workspace:*",
+    "dotenv": "*",
+    "eslint": "*",
+    "tsx": "*",
+    "typescript": "^5.7.0"
+  }
+}

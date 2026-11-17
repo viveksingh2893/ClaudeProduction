@@ -1,0 +1,7 @@
+@import "tailwindcss";
+@source "../";
+@import "@kisan4u/ui/tokens.css";
+
+:root {
+  color-scheme: light dark;
+}

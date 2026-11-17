@@ -1,0 +1,3 @@
+-- AlterEnum
+ALTER TYPE "ShipmentStatus" ADD VALUE 'RTO_INITIATED';
+ALTER TYPE "ShipmentStatus" ADD VALUE 'RTO_DELIVERED_TO_SELLER';

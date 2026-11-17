@@ -1,0 +1,4 @@
+{
+  "extends": "@kisan4u/config/typescript/base.json",
+  "include": ["src"]
+}

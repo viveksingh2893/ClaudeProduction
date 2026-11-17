@@ -1,0 +1,168 @@
+/**
+ * Kisan4U design tokens — single source of truth for both apps/web and
+ * apps/dashboard. Values are lifted from the Claude Design HTML references
+ * (Kisan4U Homepage / ProductCard / Product-Detail / Checkout / Login /
+ * Seller-Panel / Admin-Panel etc.) so the production app matches them
+ * exactly rather than approximating. Tailwind v4 reads the `@theme` block
+ * and both generates utility classes from it (bg-green-700, rounded-lg, ...)
+ * and emits every key as a real `:root` CSS custom property, so components
+ * that still need a raw value (e.g. a computed hover color) can reference
+ * `var(--color-green-700)` directly.
+ */
+@source "../";
+
+@theme {
+  --color-ink: oklch(22% 0.02 145);
+  --color-surface: oklch(99% 0.003 100);
+  --color-bg: oklch(98% 0.006 100);
+  --color-bg-dashboard: oklch(96% 0.006 145);
+  --color-border: oklch(90% 0.012 145);
+
+  --color-green-900: oklch(26% 0.07 145);
+  --color-green-800: oklch(33% 0.09 145);
+  --color-green-700: oklch(40% 0.11 145);
+  --color-green-600: oklch(48% 0.12 145);
+  --color-green-500: oklch(56% 0.13 145);
+  --color-green-100: oklch(94% 0.03 145);
+  --color-green-50: oklch(97% 0.015 145);
+
+  --color-earth-700: oklch(45% 0.09 55);
+  --color-earth-600: oklch(52% 0.1 55);
+  --color-earth-500: oklch(60% 0.11 55);
+  --color-earth-100: oklch(93% 0.03 60);
+
+  --color-gold: oklch(72% 0.13 85);
+  --color-gray-600: oklch(45% 0.01 145);
+  --color-gray-400: oklch(65% 0.01 145);
+
+  /* Semantic status colors — used by StatusBadge / AlertBox, not by ad-hoc
+     inline colors, so every status pill in the app comes from this palette. */
+  --color-success: oklch(48% 0.12 145);
+  --color-success-bg: oklch(94% 0.03 145);
+  --color-warning: oklch(58% 0.14 70);
+  --color-warning-bg: oklch(93% 0.05 70);
+  --color-danger: oklch(50% 0.15 30);
+  --color-danger-bg: oklch(94% 0.05 30);
+  --color-info: oklch(48% 0.1 230);
+  --color-info-bg: oklch(94% 0.03 230);
+
+  --radius-xs: 5px;
+  --radius-sm: 7px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+
+  --shadow-card: 0 8px 24px oklch(20% 0.05 145 / 0.12);
+  --shadow-lift: 0 10px 28px oklch(20% 0.05 145 / 0.14);
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: var(--color-bg);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a {
+    color: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-green-600);
+    outline-offset: 2px;
+  }
+}
+
+/**
+ * Shared typography for sanitized product rich-text (spec item #1) — used
+ * identically by RichTextEditor's editable area and SafeHtml's rendered
+ * output, so a description looks the same while editing as it does on the
+ * storefront. No Tailwind typography plugin is installed in this project;
+ * these are the specific rules that content actually needs (the sanitizer
+ * allowlist in packages/validators/src/rich-text.ts caps what tags/styles
+ * can ever appear here).
+ */
+.k4u-rich-content {
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
+}
+.k4u-rich-content h1,
+.k4u-rich-content h2,
+.k4u-rich-content h3,
+.k4u-rich-content h4 {
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0.75em 0 0.35em;
+}
+.k4u-rich-content h1 {
+  font-size: 1.5em;
+}
+.k4u-rich-content h2 {
+  font-size: 1.3em;
+}
+.k4u-rich-content h3 {
+  font-size: 1.15em;
+}
+.k4u-rich-content h4 {
+  font-size: 1.05em;
+}
+.k4u-rich-content p {
+  margin: 0.5em 0;
+}
+.k4u-rich-content ul,
+.k4u-rich-content ol {
+  margin: 0.5em 0;
+  padding-left: 1.5em;
+}
+.k4u-rich-content li {
+  margin: 0.2em 0;
+}
+.k4u-rich-content blockquote {
+  margin: 0.75em 0;
+  padding: 0.25em 0 0.25em 1em;
+  border-left: 3px solid var(--color-border);
+  color: var(--color-gray-600);
+}
+.k4u-rich-content a {
+  color: var(--color-green-700);
+  text-decoration: underline;
+}
+.k4u-rich-content table {
+  border-collapse: collapse;
+  margin: 0.75em 0;
+  max-width: 100%;
+}
+.k4u-rich-content td,
+.k4u-rich-content th {
+  border: 1px solid var(--color-border);
+  padding: 0.4em 0.6em;
+  text-align: left;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+.k4u-rich-content th {
+  background: var(--color-bg-dashboard);
+  font-weight: 700;
+}
+.k4u-rich-content img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  margin: 0.5em 0;
+}
+.k4u-rich-content > *:first-child {
+  margin-top: 0;
+}
+.k4u-rich-content > *:last-child {
+  margin-bottom: 0;
+}

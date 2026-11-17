@@ -1,0 +1,43 @@
+{
+  "name": "@kisan4u/db",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "generate": "prisma generate",
+    "migrate": "prisma migrate dev",
+    "studio": "prisma studio",
+    "seed": "tsx prisma/seed.ts",
+    "seed:blog": "tsx prisma/seed-blog.ts",
+    "seed:demo": "tsx prisma/seed-demo.ts",
+    "seed:demo:remove": "tsx prisma/seed-demo-cleanup.ts",
+    "seed:crops-pests": "tsx prisma/seed-crops-pests.ts",
+    "migrate:legacy-customers": "tsx prisma/migrate-legacy-customers.ts",
+    "migrate:legacy-products": "tsx prisma/migrate-legacy-products.ts",
+    "backfill:legacy-district": "tsx prisma/backfill-legacy-district.ts",
+    "migrate:private-kyc-documents": "tsx prisma/migrate-private-kyc-documents.ts",
+    "validate": "prisma validate",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "translate:product-descriptions": "tsx prisma/translate-product-descriptions.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "*",
+    "@prisma/adapter-pg": "*",
+    "pg": "*",
+    "dotenv": "*",
+    "bcryptjs": "*",
+    "@kisan4u/providers": "workspace:*",
+    "@kisan4u/validators": "workspace:*"
+  },
+  "devDependencies": {
+    "prisma": "*",
+    "tsx": "*",
+    "typescript": "^5.7.0",
+    "@types/pg": "*",
+    "eslint": "*",
+    "@kisan4u/config": "workspace:*",
+    "sharp": "^0.35.3"
+  }
+}

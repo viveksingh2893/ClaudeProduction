@@ -1,0 +1,92 @@
+import type { Dictionary } from "./en";
+
+/**
+ * Tamil (தமிழ்). Machine/assisted translation of storefront chrome —
+ * recommend a native speaker review before a wide rollout.
+ */
+export const ta: Dictionary = {
+  ribbon: {
+    becomeDealer: "டீலராகுங்கள்",
+    corporateWebsite: "நிறுவன இணையதளம்",
+    language: "மொழி",
+    chooseLanguage: "மொழியைத் தேர்ந்தெடுக்கவும்",
+  },
+  nav: {
+    home: "முகப்பு",
+    products: "பொருட்கள்",
+    wishlist: "விருப்பப் பட்டியல்",
+    cart: "கார்ட்",
+    orders: "ஆர்டர்கள்",
+    account: "கணக்கு",
+    login: "உள்நுழைவு",
+    productRequests: "பொருள் கோரிக்கைகள்",
+    alerts: "எச்சரிக்கைகள்",
+    notifications: "அறிவிப்புகள்",
+    categories: "வகைகள்",
+    doctor: "மருத்துவர்",
+    comingSoon: "விரைவில் வருகிறது",
+    search: "பொருட்கள், பிராண்டுகள் மற்றும் பலவற்றைத் தேடுங்கள்",
+    signOut: "வெளியேறு",
+  },
+  doctorPage: {
+    title: "கிசான்4யூ மருத்துவர் விரைவில் வருகிறது",
+    subtitle: "இணைந்திருங்கள்",
+  },
+  home: {
+    bestSellers: "அதிகம் விற்பனையாகுபவை",
+    trendingNow: "இப்போது பிரபலமானவை",
+    shopByBrand: "பிராண்ட் வாரியாக வாங்குங்கள்",
+    shopByCrop: "பயிர் வாரியாக வாங்குங்கள்",
+    shopByPestDisease: "பூச்சி & நோய் வாரியாக வாங்குங்கள்",
+    viewAll: "அனைத்தையும் பார்க்க",
+  },
+  pdp: {
+    description: "விவரம்",
+    ingredients: "பொருட்கள்",
+    howToUse: "பயன்படுத்தும் முறை",
+    dosage: "அளவு",
+    technicalInfo: "தொழில்நுட்பத் தகவல்",
+    addToCart: "கார்ட்டில் சேர்",
+    buyNow: "இப்போது வாங்கு",
+    outOfStock: "கையிருப்பில் இல்லை",
+  },
+  footer: {
+    tagline:
+      "விவசாய இடுபொருட்கள் மற்றும் பொது பொருட்களுக்கான பல்விற்பனையாளர் சந்தை — முதலில் டீலர்/மொத்த விற்பனை, பிறகு அனைவருக்கும் சில்லறை.",
+    customerCare: "வாடிக்கையாளர் சேவை",
+    shop: "கடை",
+    legal: "சட்டம்",
+    more: "மேலும்",
+    allProducts: "அனைத்து பொருட்கள்",
+    trackOrder: "ஆர்டரைக் கண்காணிக்கவும்",
+    becomeDealer: "டீலராகுங்கள்",
+    becomeSeller: "விற்பனையாளராகுங்கள்",
+    rightsReserved: "அனைத்து உரிமைகளும் பாதுகாக்கப்பட்டவை.",
+  },
+  account: {
+    welcome: "வரவேற்பு",
+    welcomeName: "வரவேற்பு, {name}",
+    loggedInAs: "{role} ஆக உள்நுழைந்துள்ளீர்கள்",
+    roleCustomer: "வாடிக்கையாளர்",
+    roleDealer: "டீலர்",
+    browseProducts: "தயாரிப்புகளைப் பார்",
+    dealerCatalogue: "டீலர் பட்டியல்",
+    myRequests: "என் கோரிக்கைகள்",
+    cart: "கார்ட்",
+    myOrders: "என் ஆர்டர்கள்",
+    savedAddresses: "சேமித்த முகவரிகள்",
+    wallet: "Kisan4U வாலட்",
+    profile: "சுயவிவரம்",
+    businessAssociate: "பிசினஸ் அசோசியேட்",
+    walletBalance: "Kisan4U வாலட் இருப்பு",
+    manageWallet: "வாலட்டை நிர்வகி",
+  },
+  cookieConsent: {
+    title: "நாங்கள் குக்கீகளைப் பயன்படுத்துகிறோம்",
+    message: "நீங்கள் Kisan4U-ஐ எப்படிப் பயன்படுத்துகிறீர்கள் என்பதைப் புரிந்துகொள்ளவும், உங்களுக்குப் பயனுள்ள சலுகைகளைக் காட்டவும் Meta (Facebook) குக்கீகள் உட்பட குக்கீகளைப் பயன்படுத்துகிறோம். அடிக்குறிப்பில் உள்ள குக்கீ அமைப்புகளில் இதை எப்போது வேண்டுமானாலும் மாற்றலாம்.",
+    accept: "ஏற்கிறேன்",
+    decline: "மறுக்கிறேன்",
+    privacy: "தனியுரிமைக் கொள்கை",
+    settings: "குக்கீ அமைப்புகள்",
+  },
+};
